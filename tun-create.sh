@@ -36,6 +36,11 @@
 #   -o, --ssh-option <список>
 #                          доп. опции ssh через пробел, каждая станет своим -o:
 #                          -o 'Compression=yes ProxyJump=bastion'
+#   -K, --ctrl-key <путь>  ключ контроллера для заходов на host1/host2
+#                          (включает IdentitiesOnly: спасение от MaxAuthTries,
+#                          когда в агенте много ключей)
+#   -O, --ctrl-ssh-option <список>
+#                          доп. опции ssh для заходов контроллера, через пробел
 #   -f, --force            перезаписать чужой юнит и обновить опции строки ключа
 #       --teardown, --remove
 #                          снять сервис на host1 (строку ключа не трогает)
@@ -61,6 +66,8 @@ DIR_SRC=''            # option | token | default
 INIT_SYSTEM=''        # systemd | openrc
 NAME=''
 KEY_PATH=''
+CTRL_KEY=''           # ключ контроллера для заходов на хосты
+CTRL_EXTRA=()         # доп. -o для заходов контроллера
 EXTRA_OPTS=()
 DRY_RUN=0
 VERBOSE=0
@@ -262,8 +269,8 @@ parse_endpoint() {
 }
 
 parse_args() {
-    local short='hvdfo:LlRr:n:k:'
-    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,teardown,remove,name:,key:,ssh-option:'
+    local short='hvdfo:LlRr:n:k:K:O:'
+    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,teardown,remove,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
     local parsed d v
     local -a parts=()
 
@@ -289,6 +296,14 @@ parse_args() {
             --openrc)  set_init openrc ;;
             -n|--name) NAME=$2; shift ;;
             -k|--key)  KEY_PATH=$2; shift ;;
+            -K|--ctrl-key) CTRL_KEY=$2; shift ;;
+            -O|--ctrl-ssh-option)
+                v=$2
+                parts=()
+                read -r -a parts <<<"$v" || true
+                CTRL_EXTRA+=("${parts[@]}")
+                shift
+                ;;
             -o|--ssh-option)
                 # список опций через пробел; каждая станет отдельным -o
                 v=$2
@@ -332,6 +347,19 @@ parse_args() {
     DIR_SRC=${DIR_SRC:-default}
     INIT_SYSTEM=${INIT_SYSTEM:-systemd}
     NAME=$(sanitize_name "${NAME:-ssh-tun-${E2_HOST}-${E2_PORT}}")
+
+    # Заходы контроллера на хосты: если в ssh-агенте много ключей, sshd успевает
+    # выдать MaxAuthTries раньше, чем дойдёт до нужного. Явный ключ + IdentitiesOnly
+    # режет перебор до одного кандидата.
+    local x
+    if [[ -n $CTRL_KEY ]]; then
+        CTRL_KEY=${CTRL_KEY/#\~/$HOME}
+        [[ -r $CTRL_KEY ]] || die "ключ контроллера не читается: $CTRL_KEY"
+        CTRL_SSH_OPTS+=(-o IdentitiesOnly=yes -i "$CTRL_KEY")
+    fi
+    for x in "${CTRL_EXTRA[@]}"; do
+        CTRL_SSH_OPTS+=(-o "$x")
+    done
 }
 
 # -----------------------------------------------------------------------------

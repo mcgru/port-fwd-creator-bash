@@ -96,3 +96,29 @@ tun-create.sh: getopt, разбор адресов с IPv6 в скобках, к
 через туннель), teardown, уборка тестовых артефактов. Системд-ветка
 проверена через systemd-analyze verify, живьём недоступна: оба хоста Gentoo
 с openrc.
+
+## 3. Живой systemd-прогон (дословно)
+
+прогони тесты systemd туннель от хоста sss  до ttt (без root!)
+
+### Ответ и результат
+
+Короткий ответ: прогнал, работает без root, но постоянная работа без сессий
+требует linger, а это уже root.
+
+Что выяснилось до прогона: sss — systemd, пользователь smelov, linger=no;
+ttt принимает только один конкретный ключ, а контроллер с 12 ключами в агенте
+упирался в MaxAuthTries (Too many authentication failures). Поэтому в скрипт
+добавлены -K/--ctrl-key (IdentitiesOnly + -i для заходов контроллера) и
+-O/--ctrl-ssh-option.
+
+Прогон: sss:127.0.0.1:18081 -> ttt:127.0.0.1:22 с -K ~/.ssh/id_ed25519.
+Ключ создан на sss, строка restrict,port-forwarding,permitopen="127.0.0.1:22"
+добавлена на ttt, known_hosts заполнен, юнит
+~/.config/systemd/user/ssh-tun-ttt-22.service записан, enable и start от
+smelov, порт слушается, через него приходит баннер SSH-2.0-OpenSSH_9.6p1
+Ubuntu-3ubuntu13.20. Журнал: started, stopped при закрытии сессии, started
+снова при новой сессии — без linger сервис живёт только при активной сессии.
+teardown убрал юнит, порт закрылся; тестовый ключ и его строка после проверки
+удалены.
+
