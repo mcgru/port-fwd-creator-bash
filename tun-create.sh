@@ -13,6 +13,8 @@
 #   tun-create.sh u1@host1:127.0.0.1:8080 -R u2@host2:127.0.0.1:80
 #   tun-create.sh host1::8080 '}}}' host2::80 --openrc
 #   tun-create.sh u1@host1:127.0.0.1:8080 "<<<" u2@host2:10.0.0.5:80 --dry-run
+#   tun-create.sh --from sss::18080 --to ttt::22 -L --no-persist
+#   tun-create.sh --run 4459 --to ttt::172.17.0.1:4444
 #
 # Направление -- это то, с какой стороны слушается порт, то есть какой флаг
 # уйдёт в ssh. Само ssh-соединение туннеля всегда инициируется с host1 на host2.
@@ -48,6 +50,17 @@
 #                          (ни systemd, ни openrc): удобно для разовых проверок
 #       --check            только проверить, настроен ли туннель (ничего не меняет)
 #       --history          показать все успешные создания из history.success
+#       --from <адрес>     адрес host1 вместо первого аргумента; опция сильнее
+#                          аргумента, поэтому при расхождении берётся она
+#       --to <адрес>       адрес host2 вместо второго аргумента
+#       --run <момент>     повторить самый свежий успешный запуск, время
+#                          которого оканчивается на <момент> (сс, ммсс или
+#                          ччммсс; ведущие нули не важны, дата не участвует).
+#                          Поиск идёт с конца history.success, берётся первое
+#                          совпадение; адреса и опции берутся из истории, но
+#                          текущие опции главнее: --from/--to, -L/-R,
+#                          --no-persist и прочие применяются поверх.
+#                          Позиционные адреса с --run не указываются.
 #   -d, --dry-run          показать план и ничего не делать
 #   -v, --verbose          печатать выполняемые команды
 #   -h, --help             справка
@@ -64,6 +77,11 @@ SCRIPT_VERSION='0.1.0'
 SCRIPT_PATH=$0
 ORIG_ARGS=("$@")
 
+# Набор опций для getopt: им же канонизируются аргументы из истории (--run),
+# поэтому список живёт в одном месте.
+OPT_SHORT='hvdfo:LlRr:n:k:K:O:'
+OPT_LONG='help,version,dry-run,verbose,force,local,remote,systemd,openrc,no-persist,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:,from:,to:,run:'
+
 # -----------------------------------------------------------------------------
 # Глобальное состояние (заполняется разбором аргументов и по ходу работы)
 # -----------------------------------------------------------------------------
@@ -73,6 +91,9 @@ DIR_SRC=''            # option | token | default
 INIT_SYSTEM=''        # systemd | openrc
 NAME=''
 KEY_PATH=''
+FROM_OPT=''           # --from: адрес host1, сильнее позиционного аргумента
+TO_OPT=''             # --to: адрес host2
+RUN_MOMENT=''         # --run: момент успешного запуска из history.success
 CTRL_KEY=''           # ключ контроллера для заходов на хосты
 CTRL_EXTRA=()         # доп. -o для заходов контроллера
 EXTRA_OPTS=()
@@ -401,14 +422,12 @@ parse_endpoint() {
 }
 
 parse_args() {
-    local short='hvdfo:LlRr:n:k:K:O:'
-    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,no-persist,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
     local parsed d v
     local -a parts=()
 
     command -v getopt >/dev/null 2>&1 || die "нужен getopt (util-linux)"
 
-    if ! parsed=$(getopt -o "$short" --long "$long" -n "$SCRIPT_NAME" -- "$@"); then
+    if ! parsed=$(getopt -o "$OPT_SHORT" --long "$OPT_LONG" -n "$SCRIPT_NAME" -- "$@"); then
         usage >&2
         exit 2
     fi
@@ -425,6 +444,9 @@ parse_args() {
             --no-persist) NOPERSIST=1 ;;
             --check)      CHECK=1 ;;
             --history)    HISTORY=1 ;;
+            --from)       FROM_OPT=$2; shift ;;
+            --to)         TO_OPT=$2; shift ;;
+            --run)        RUN_MOMENT=$2; shift ;;
             -L|-l|--local)  set_direction L option ;;
             -R|-r|--remote) set_direction R option ;;
             --systemd) set_init systemd ;;
@@ -467,6 +489,9 @@ parse_args() {
         if (( CHECK || TEARDOWN || DRY_RUN )); then
             die "--history несовместим с --check/--teardown/--dry-run"
         fi
+        if [[ -n $RUN_MOMENT ]]; then
+            die "--history несовместим с --run"
+        fi
         return 0
     fi
 
@@ -490,29 +515,69 @@ parse_args() {
         RUN_MODE=create
     fi
 
-    case ${#POSITIONAL[@]} in
-        2)
-            parse_endpoint "${POSITIONAL[0]}" 1
-            parse_endpoint "${POSITIONAL[1]}" 2
-            ;;
-        3)
-            parse_endpoint "${POSITIONAL[0]}" 1
-            if ! d=$(parse_direction_token "${POSITIONAL[1]}"); then
-                die "не понял направление: ${POSITIONAL[1]} (ожидается -L/-R, >, >>, >>>, }, }}, }}}, <, <<, <<<, {, {{, {{{)"
-            fi
-            set_direction "$d" token
-            parse_endpoint "${POSITIONAL[2]}" 2
-            ;;
-        *)
-            usage >&2
-            die "нужно 2 или 3 позиционных аргумента, а не ${#POSITIONAL[@]}"
-            ;;
-    esac
+    local npos=${#POSITIONAL[@]}
+    if [[ -n $RUN_MOMENT ]]; then
+        # Адреса при --run берутся из history.success; текущие --from/--to и
+        # опции -- это оверрайд. Позиционные адреса тут только путали бы.
+        if (( npos > 0 )); then
+            die "с --run адреса берутся из истории: используй --from/--to и -L/-R, позиционные аргументы не нужны"
+        fi
+    else
+        case $npos in
+            0)
+                if [[ -z $FROM_OPT || -z $TO_OPT ]]; then
+                    usage >&2
+                    die "нужны адреса: два позиционных аргумента или --from и --to"
+                fi
+                ;;
+            1)
+                # один аргумент дополняет недостающую опцию: --from задан --
+                # аргумент описывает host2, и наоборот
+                if [[ -n $FROM_OPT ]]; then
+                    parse_endpoint "${POSITIONAL[0]}" 2
+                elif [[ -n $TO_OPT ]]; then
+                    parse_endpoint "${POSITIONAL[0]}" 1
+                else
+                    die "один адрес без --from/--to не понять: укажи, какой это конец туннеля"
+                fi
+                ;;
+            2)
+                parse_endpoint "${POSITIONAL[0]}" 1
+                parse_endpoint "${POSITIONAL[1]}" 2
+                ;;
+            3)
+                parse_endpoint "${POSITIONAL[0]}" 1
+                if ! d=$(parse_direction_token "${POSITIONAL[1]}"); then
+                    die "не понял направление: ${POSITIONAL[1]} (ожидается -L/-R, >, >>, >>>, }, }}, }}}, <, <<, <<<, {, {{, {{{)"
+                fi
+                set_direction "$d" token
+                parse_endpoint "${POSITIONAL[2]}" 2
+                ;;
+            *)
+                usage >&2
+                die "нужно 2 или 3 позиционных аргумента, а не $npos"
+                ;;
+        esac
+    fi
+
+    # Опция сильнее аргумента: раз --from/--to написали, она и задаёт адрес.
+    # Разбор идёт после позиционных, поэтому просто перекрывает их.
+    if [[ -n $FROM_OPT ]]; then
+        parse_endpoint "$FROM_OPT" 1
+    fi
+    if [[ -n $TO_OPT ]]; then
+        parse_endpoint "$TO_OPT" 2
+    fi
 
     DIRECTION=${DIRECTION:-L}
     DIR_SRC=${DIR_SRC:-default}
     INIT_SYSTEM=${INIT_SYSTEM:-systemd}
-    NAME=$(sanitize_name "${NAME:-ssh-tun-${E2_HOST}-${E2_PORT}}")
+    if [[ -n $RUN_MOMENT && -z $E2_HOST ]]; then
+        # адреса ещё не известны -- их принесёт --run; не выдумываем имя
+        NAME='?'
+    else
+        NAME=$(sanitize_name "${NAME:-ssh-tun-${E2_HOST}-${E2_PORT}}")
+    fi
 
     # Заходы контроллера на хосты: если в ssh-агенте много ключей, sshd успевает
     # выдать MaxAuthTries раньше, чем дойдёт до нужного. Явный ключ + IdentitiesOnly
@@ -527,6 +592,199 @@ parse_args() {
         CTRL_SSH_OPTS+=(-o "$x")
     done
 }
+
+# Каноническое имя опции, как его отдаёт getopt (один токен на опцию), и
+# признак «за ним идёт значение». Для направления печатается ещё L или R.
+opt_name() {
+    case $1 in
+        -h|--help)            printf 'help' ;;
+        --version)            printf 'version' ;;
+        -d|--dry-run)         printf 'dry-run' ;;
+        -v|--verbose)         printf 'verbose' ;;
+        -f|--force)           printf 'force' ;;
+        -L|-l|--local)        printf 'direction L' ;;
+        -R|-r|--remote)       printf 'direction R' ;;
+        --systemd)            printf 'systemd' ;;
+        --openrc)             printf 'openrc' ;;
+        --no-persist)         printf 'no-persist' ;;
+        --teardown|--remove)  printf 'teardown' ;;
+        --check)              printf 'check' ;;
+        --history)            printf 'history' ;;
+        -n|--name)            printf 'name 1' ;;
+        -k|--key)             printf 'key 1' ;;
+        -K|--ctrl-key)        printf 'ctrl-key 1' ;;
+        -O|--ctrl-ssh-option) printf 'ctrl-ssh-option 1' ;;
+        -o|--ssh-option)      printf 'ssh-option 1' ;;
+        --from)               printf 'from 1' ;;
+        --to)                 printf 'to 1' ;;
+        --run)                printf 'run 1' ;;
+        *) return 1 ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# --run: повтор успешного запуска из history.success
+#
+# Берём последнюю строку, время которой оканчивается на MOMENT (сс, ммсс или
+# ччммсс; ведущие нули не важны). Команда из строки воспроизводится заново,
+# но текущие опции главнее: --from/--to, -L/-R и прочие перекрывают
+# исторические. Реализация не тащит состояние через глобальные переменные:
+# собираем argv и делаем exec того же скрипта.
+# -----------------------------------------------------------------------------
+run_from_history() {
+    local line best='' best_time='' d t rest digits info name cmdline
+    local tail head pre parsed
+    local -a hist_args=() cur=() kept=() pos=() merged=()
+    local -A cur_opt=()
+    local cur_dir=''
+
+    digits=${RUN_MOMENT//[^0-9]/}
+    [[ -n $digits ]] || die "--run: в MOMENT нет цифр: $RUN_MOMENT"
+    (( ${#digits} <= 6 )) || die "--run: MOMENT длиннее 6 цифр (сс, ммсс или ччммсс): $RUN_MOMENT"
+    # приведение к целому: 02:44:59, 024459 и 24459 -- одно и то же
+    digits=$((10#$digits))
+
+    [[ -f $HISTORY_SUCCESS ]] || die "успешных запусков ещё нет: $HISTORY_SUCCESS"
+
+    # Идём с конца файла: нужно первое совпадение с конца, то есть самый
+    # свежий запуск. Дата не участвует, сравнивается только время.
+    local -a lines=()
+    local i ts n
+    mapfile -t lines <"$HISTORY_SUCCESS"
+    for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
+        line=${lines[i]}
+        case $line in
+            ''|'#'*) continue ;;
+        esac
+        read -r d t rest <<<"$line"
+        [[ $t == [0-9][0-9]:[0-9][0-9]:[0-9][0-9] ]] || continue
+        # 02:44:59 -> 24459. Отсекаем с конца столько цифр, сколько их в
+        # значении --run: 59 -- секунды, 4459 -- минуты и секунды.
+        ts=${t//:/}
+        ts=$((10#$ts))
+        n=$((10 ** ${#digits}))
+        if (( ts % n == digits )); then
+            best=$line
+            best_time="$d $t"
+            break
+        fi
+    done
+    [[ -n $best ]] || die "в $HISTORY_SUCCESS нет запуска, время которого оканчивается на $digits"
+
+    # Команда -- в конце строки и начинается с пути к скрипту.
+    tail=${best##*"$SCRIPT_NAME"}
+    head=${best%"$tail"}
+    pre=${head%"$SCRIPT_NAME"}
+    pre=${pre%"${pre##*[[:space:]]}"}
+    cmdline=${best:${#pre}}
+    cmdline=${cmdline%% | *}
+    [[ -n $cmdline ]] || die "не нашёл команду в строке истории: $best"
+
+    # В истории строка записана через printf %q, поэтому eval возвращает ровно
+    # те же аргументы; первый -- путь к скрипту, его заменяем своим.
+    eval "hist_args=($cmdline)" || die "не смог разобрать команду из истории: $cmdline"
+    (( ${#hist_args[@]} > 0 )) || die "пустая команда в истории"
+    hist_args=("${hist_args[@]:1}")
+
+    # Текущие опции: канонизируем и запоминаем, что перекрывать. Позиционных
+    # аргументов с --run нет, поэтому здесь только опции.
+    parsed=$(getopt -o "$OPT_SHORT" --long "$OPT_LONG" -n "$SCRIPT_NAME" -- "${ORIG_ARGS[@]}") \
+        || die "не смог разобрать текущие опции"
+    eval set -- "$parsed"
+    while (( $# )); do
+        [[ $1 == -- ]] && break
+        info=$(opt_name "$1") || die "внутренняя ошибка разбора опции: $1"
+        name=${info%% *}
+        if [[ $name == run ]]; then
+            shift
+            shift
+            continue
+        fi
+        if [[ $name == direction ]]; then
+            cur_dir=${info#* }
+            cur_opt[direction]=1
+            cur+=("$1")
+            shift
+        else
+            cur_opt[$name]=1
+            cur+=("$1")
+            shift
+            if [[ $info == *' 1' ]]; then
+                cur+=("$1")
+                shift
+            fi
+        fi
+    done
+
+    # Опции из истории: --run не повторяем, перекрытое текущими выбрасываем.
+    parsed=$(getopt -o "$OPT_SHORT" --long "$OPT_LONG" -n "$SCRIPT_NAME" -- "${hist_args[@]}") \
+        || die "не смог разобрать команду из истории: $cmdline"
+    eval set -- "$parsed"
+    while (( $# )); do
+        [[ $1 == -- ]] && { shift; break; }
+        info=$(opt_name "$1") || die "не понял опцию в истории: $1"
+        name=${info%% *}
+        case $name in
+            direction)
+                if [[ -z $cur_dir ]]; then
+                    kept+=("$1")
+                fi
+                shift
+                ;;
+            run)
+                shift
+                shift
+                ;;
+            *)
+                if [[ -n ${cur_opt[$name]:-} ]]; then
+                    shift
+                    if [[ $info == *' 1' ]]; then shift; fi
+                else
+                    kept+=("$1")
+                    shift
+                    if [[ $info == *' 1' ]]; then
+                        kept+=("$1")
+                        shift
+                    fi
+                fi
+                ;;
+        esac
+    done
+    # После "--" -- позиционные адреса из истории. Направление из этой позиции
+    # выбрасываем, если оно задано текущей опцией; адрес -- если его перекрыли
+    # текущие --from/--to (иначе в истории останется лишний старый адрес).
+    local side=1
+    while (( $# )); do
+        if parse_direction_token "$1" >/dev/null 2>&1; then
+            if [[ -z $cur_dir ]]; then
+                pos+=("$1")
+            fi
+            shift
+            continue
+        fi
+        if (( side == 1 )); then
+            if [[ -z ${cur_opt[from]:-} ]]; then
+                pos+=("$1")
+            fi
+            side=2
+        else
+            if [[ -z ${cur_opt[to]:-} ]]; then
+                pos+=("$1")
+            fi
+        fi
+        shift
+    done
+
+    merged=("${kept[@]}" "${cur[@]}" -- "${pos[@]}")
+
+    printf 'Беру успешный запуск %s из %s\n' "$best_time" "$HISTORY_SUCCESS" >&2
+    if (( VERBOSE )); then
+        printf 'Запускаю: ' >&2
+        show_cmd "$SCRIPT_PATH" "${merged[@]}" >&2
+    fi
+    exec "$SCRIPT_PATH" "${merged[@]}"
+}
+
 
 # -----------------------------------------------------------------------------
 # Разрешение хостов через ssh -G
@@ -1754,6 +2012,12 @@ main() {
     if (( HISTORY )); then
         print_history
         return 0
+    fi
+
+    # --run до любых ssh-заходов: он только собирает argv и делает exec.
+    if [[ -n $RUN_MOMENT ]]; then
+        run_from_history
+        die "--run: exec не удался"
     fi
 
     resolve_endpoints
