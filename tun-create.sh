@@ -61,6 +61,10 @@
 #                          текущие опции главнее: --from/--to, -L/-R,
 #                          --no-persist и прочие применяются поверх.
 #                          Позиционные адреса с --run не указываются.
+#                          Перед реальным запуском показывает найденный момент
+#                          и итоговую команду, затем спрашивает
+#                          "Запускаем? [Y/n]": Enter или y -- запуск, n или
+#                          Ctrl+C -- отмена. С --dry-run и --check не спрашивает.
 #   -d, --dry-run          показать план и ничего не делать
 #   -v, --verbose          печатать выполняемые команды
 #   -h, --help             справка
@@ -777,11 +781,39 @@ run_from_history() {
 
     merged=("${kept[@]}" "${cur[@]}" -- "${pos[@]}")
 
-    printf 'Беру успешный запуск %s из %s\n' "$best_time" "$HISTORY_SUCCESS" >&2
-    if (( VERBOSE )); then
-        printf 'Запускаю: ' >&2
-        show_cmd "$SCRIPT_PATH" "${merged[@]}" >&2
+    printf '\nНайден успешный запуск %s (%s)\n' "$best_time" "$HISTORY_SUCCESS" >&2
+    printf '\nКоманда с учётом текущих опций:\n\n  ' >&2
+    show_cmd "$SCRIPT_PATH" "${merged[@]}" >&2
+
+    # --dry-run и --check ничего не меняют, поэтому подтверждение не нужно.
+    if (( DRY_RUN || CHECK )); then
+        exec "$SCRIPT_PATH" "${merged[@]}"
     fi
+
+    # Без терминала подтвердить некому: молча ничего не запускаем.
+    if [[ ! -t 0 ]]; then
+        printf '\nНет терминала для подтверждения: запуск отменён, запусти интерактивно.\n' >&2
+        RUN_MODE=''
+        exit 1
+    fi
+
+    local answer=''
+    printf '\nЗапускаем? [Y/n] ' >&2
+    if ! IFS= read -r answer; then
+        # Ctrl+D -- тоже отказ
+        printf '\nОтменено.\n' >&2
+        RUN_MODE=''
+        exit 0
+    fi
+    case $answer in
+        ''|y|Y|yes|Yes|YES|д|Д|да|Да|ДА) : ;;
+        *)
+            printf 'Отменено.\n' >&2
+            RUN_MODE=''
+            exit 0
+            ;;
+    esac
+
     exec "$SCRIPT_PATH" "${merged[@]}"
 }
 
@@ -2014,10 +2046,10 @@ main() {
         return 0
     fi
 
-    # --run до любых ssh-заходов: он только собирает argv и делает exec.
+    # --run до любых ssh-заходов: он собирает argv и уходит в exec (или в exit,
+    # если подтверждения нет).
     if [[ -n $RUN_MOMENT ]]; then
         run_from_history
-        die "--run: exec не удался"
     fi
 
     resolve_endpoints
