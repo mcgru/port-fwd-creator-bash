@@ -44,6 +44,8 @@
 #   -f, --force            перезаписать чужой юнит и обновить опции строки ключа
 #       --teardown, --remove
 #                          снять сервис на host1 (строку ключа не трогает)
+#       --no-persist       настроить туннель, но не создавать сервис
+#                          (ни systemd, ни openrc): удобно для разовых проверок
 #       --check            только проверить, настроен ли туннель (ничего не меняет)
 #       --history          показать все успешные создания из history.success
 #   -d, --dry-run          показать план и ничего не делать
@@ -78,6 +80,7 @@ DRY_RUN=0
 VERBOSE=0
 FORCE=0
 TEARDOWN=0
+NOPERSIST=0           # --no-persist: настроить, но сервис не создавать
 CHECK=0               # --check: только проверка, без изменений
 HISTORY=0             # --history: показать history.success
 STEP_NO=1
@@ -399,7 +402,7 @@ parse_endpoint() {
 
 parse_args() {
     local short='hvdfo:LlRr:n:k:K:O:'
-    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
+    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,no-persist,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
     local parsed d v
     local -a parts=()
 
@@ -419,6 +422,7 @@ parse_args() {
             -v|--verbose) VERBOSE=1 ;;
             -f|--force)   FORCE=1 ;;
             --teardown|--remove) TEARDOWN=1 ;;
+            --no-persist) NOPERSIST=1 ;;
             --check)      CHECK=1 ;;
             --history)    HISTORY=1 ;;
             -L|-l|--local)  set_direction L option ;;
@@ -478,6 +482,9 @@ parse_args() {
     elif (( DRY_RUN )); then
         RUN_MODE=dry-run
     elif (( TEARDOWN )); then
+        if (( NOPERSIST )); then
+            die "конфликт: --no-persist и --teardown (сервис не создавался)"
+        fi
         RUN_MODE=teardown
     else
         RUN_MODE=create
@@ -569,8 +576,12 @@ resolve_endpoints() {
 
 # Правило проброса и сторона, которая слушает.
 setup_forward() {
+    # localhost -- то же самое, что 127.0.0.1, но в сокете он выглядит иначе;
+    # нормализуем сразу, иначе проверка адреса прослушивания не сойдётся.
     NET_IP1=${E1_IP:-127.0.0.1}
     NET_IP2=${E2_IP:-127.0.0.1}
+    [[ $NET_IP1 == localhost ]] && NET_IP1=127.0.0.1
+    [[ $NET_IP2 == localhost ]] && NET_IP2=127.0.0.1
 
     FWD_ARGS=()
     if [[ $DIRECTION == L ]]; then
@@ -607,8 +618,12 @@ print_plan() {
     printf '  host2 (приёмник):    %s  -> %s:%s\n' "$E2_HOST" "$H2_CANON_HOST" "$H2_SSH_PORT"
     printf '  направление:         %s\n' "$dir_desc"
     printf '  правило:             %s\n' "$rule_desc"
-    printf '  сервис на host1:     %s\n' "$NAME"
-    printf '  менеджер сервисов:   %s\n' "$( [[ $INIT_SYSTEM == systemd ]] && printf 'systemd --user' || printf 'openrc' )"
+    if (( NOPERSIST )); then
+        printf '  сервис на host1:     не создаётся (--no-persist)\n'
+    else
+        printf '  сервис на host1:     %s\n' "$NAME"
+        printf '  менеджер сервисов:   %s\n' "$( [[ $INIT_SYSTEM == systemd ]] && printf 'systemd --user' || printf 'openrc' )"
+    fi
     printf '  ключ на host1:       %s\n' "${KEY_PATH:-~/.ssh/id_ed25519}"
     if (( ${#EXTRA_OPTS[@]} )); then
         printf '  доп. опции ssh:      %s\n' "${EXTRA_OPTS[*]}"
@@ -724,7 +739,16 @@ else
     case $line in
         *"$req"*) printf 'RESULT=exists\n' ;;
         *)
-            if [ "$force" = 1 ]; then
+            # Строку, созданную этим скриптом, узнаём по комментарию tun-create:
+            # её можно обновлять без --force, она целиком наша. Чужую строку
+            # трогаем только по явному --force.
+            suffix=${line#*" $ptype $pblob"}
+            suffix=${suffix# }
+            case $suffix in
+                tun-create:*) owner=ours ;;
+                *)            owner=foreign ;;
+            esac
+            if [ "$force" = 1 ] || [ "$owner" = ours ]; then
                 newline="$opts $ptype $pblob $comment"
                 tmp=$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXX") || { echo "ERR mktemp"; exit 3; }
                 while IFS= read -r l; do
@@ -735,7 +759,11 @@ else
                 done < "$ak" > "$tmp"
                 chmod 600 "$tmp"
                 mv "$tmp" "$ak"
-                printf 'RESULT=updated\n'
+                if [ "$owner" = ours ]; then
+                    printf 'RESULT=updated\n'
+                else
+                    printf 'RESULT=forced\n'
+                fi
             else
                 printf 'RESULT=restricted\n'
                 printf 'LINE=%s\n' "$line"
@@ -769,10 +797,12 @@ REMOTE
     case $result in
         added)      log "  строка ключа добавлена: $PERMIT_OPTS" ;;
         exists)     log "  строка ключа уже есть с нужными опциями" ;;
-        updated)    log "  строка ключа переписана под $PERMIT_OPTS" ;;
+        updated)    log "  своя строка ключа обновлена под $PERMIT_OPTS" ;;
+        forced)     log "  чужая строка ключа переписана под $PERMIT_OPTS (--force)" ;;
         restricted)
-            warn "ключ уже прописан, но без $PERMIT_KIND=\"$PERMIT_VALUE\""
-            warn "если туннель не поднимется -- добавь опцию в строку руками или запусти с --force"
+            die "ключ на host2 уже прописан с другими опциями, а нужного $PERMIT_KIND=\"$PERMIT_VALUE\" нет.
+Строка принадлежит не tun-create, поэтому без --force её не трогаю.
+Либо запусти с --force (строка будет переписана), либо поправь её на host2 руками."
             ;;
         *) die "непонятный результат этапа authorized_keys: ${result:-пусто}" ;;
     esac
@@ -1111,7 +1141,12 @@ stage_persistence() {
 # Этап 6: проверка, что порт слушается
 # -----------------------------------------------------------------------------
 do_verify() {
-    step "Проверяю, что порт ${LISTEN_PORT} слушается на ${LISTEN_IP}"
+    step "Проверяю, что порт ${LISTEN_PORT} слушается на $(fmt_addr "$LISTEN_IP")"
+
+    if (( NOPERSIST )); then
+        log "  сервис не создавался (--no-persist), прослушивание не проверяю"
+        return 0
+    fi
 
     if [[ $SERVICE_START == need-root ]]; then
         # openrc: сервис ставит root, до установки проверять нечего
@@ -1135,9 +1170,28 @@ REMOTE
     fi
 
     if [[ -n $out ]]; then
-        VERIFY_OK=1
-        printf '  слушается:\n'
-        sed 's/^/    /' <<<"$out"
+        # Порт может слушаться не на том адресе, который просили: sshd для -R
+        # без GatewayPorts привязывает loopback и молча игнорирует адрес из -R.
+        local want line found=0
+        local -a f=()
+        want="$(fmt_addr "$LISTEN_IP"):${LISTEN_PORT}"
+        while IFS= read -r line; do
+            read -r -a f <<<"$line"
+            [[ ${f[3]:-} == "$want" ]] && found=1
+        done <<<"$out"
+
+        if (( found )); then
+            VERIFY_OK=1
+            printf '  слушается:\n'
+            sed 's/^/    /' <<<"$out"
+        else
+            VERIFY_OK=0
+            warn "порт ${LISTEN_PORT} слушается, но не на ${want}:"
+            sed 's/^/    /' <<<"$out" >&2
+            if [[ $DIRECTION == R ]] && ! is_loopback "$NET_IP2"; then
+                warn "sshd на host2 привязал -R к loopback: чтобы слушать $(fmt_addr "$NET_IP2"), в его sshd_config нужен GatewayPorts clientspecified"
+            fi
+        fi
     else
         VERIFY_OK=0
         warn "порт ${LISTEN_PORT} пока не слушается"
@@ -1476,22 +1530,47 @@ REMOTE
         check_no "порт ${LISTEN_PORT} на ${LISTEN_TARGET}: не смог проверить"
         return 0
     fi
-    if [[ -n ${out//[[:space:]]/} ]]; then
-        check_ok "порт ${LISTEN_PORT} слушается на ${LISTEN_IP} (${LISTEN_TARGET##*@})"
-    else
-        check_no "порт ${LISTEN_PORT} на ${LISTEN_IP} не слушается"
+    if [[ -z ${out//[[:space:]]/} ]]; then
+        check_no "порт ${LISTEN_PORT} на $(fmt_addr "$LISTEN_IP") не слушается"
+        return 0
     fi
+
+    local want line addr found=0
+    local -a f=()
+    want="$(fmt_addr "$LISTEN_IP"):${LISTEN_PORT}"
+    while IFS= read -r line; do
+        read -r -a f <<<"$line"
+        [[ ${f[3]:-} == "$want" ]] && found=1
+    done <<<"$out"
+
+    if (( found )); then
+        check_ok "порт ${LISTEN_PORT} слушается на $(fmt_addr "$LISTEN_IP") (${LISTEN_TARGET##*@})"
+        return 0
+    fi
+
+    # Адрес не совпал: чаще всего sshd для -R молча привязался к loopback.
+    read -r -a f <<<"$(head -n 1 <<<"$out")"
+    addr=${f[3]:-неизвестно}
+    check_no "порт ${LISTEN_PORT} слушается на ${addr}, а ожидался ${want}"
     return 0
 }
 
 do_check() {
     step "Проверяю, настроен ли туннель ${NAME} (только чтение)"
-    check_init_match
+    if (( NOPERSIST )); then
+        check_info "менеджер сервисов не важен (--no-persist)"
+    else
+        check_init_match
+    fi
     check_access
     check_key
     check_authorized_keys
     check_known_hosts
-    check_service
+    if (( NOPERSIST )); then
+        check_info "сервис не запрашивался (--no-persist)"
+    else
+        check_service
+    fi
     check_port
 
     printf '\nПроверок: %d, проблем: %d\n' "$CHECK_TOTAL" "$CHECK_FAIL"
@@ -1508,6 +1587,19 @@ do_check() {
 # -----------------------------------------------------------------------------
 print_memo() {
     printf '\nПамятка\n'
+
+    if (( NOPERSIST )); then
+        printf '\nРежим --no-persist: сервис на host1 не создавался, автозапуска нет.\n'
+        printf '\nПоднять туннель вручную (пользователь %s на host1 %s):\n\n' "$H1_USER" "$E1_HOST"
+        printf 'ssh %s\n' "$SSH_ARGS_STR"
+        if [[ $DIRECTION == R ]] && ! is_loopback "$NET_IP2"; then
+            printf '\nhost2 слушает не loopback-адрес, для этого в sshd на %s нужен GatewayPorts:\n\n' "$E2_HOST"
+            printf 'GatewayPorts clientspecified\n'
+            printf '\nБез него sshd привяжет порт к 127.0.0.1, а не к %s.\n' "$(fmt_addr "$NET_IP2")"
+        fi
+        printf '\nСервиса нет, снимать нечего: достаточно Ctrl+C в окне с ssh.\n'
+        return 0
+    fi
 
     if [[ $INIT_SYSTEM == systemd ]]; then
         if [[ ${SERVICE_START:-} != started || ${LINGER_VALUE:-} == no ]]; then
@@ -1609,10 +1701,16 @@ print_dry_run() {
     printf '  1. host1: взять или создать ключ %s\n' "${KEY_PATH:-~/.ssh/id_ed25519}"
     printf '  2. host2: проверить/дописать строку ключа с опциями %s\n' "$PERMIT_OPTS"
     printf '  3. host1: прописать host2 в known_hosts первым коннектом\n'
-    printf '  4. host1: оформить сервис %s (%s)\n' "$NAME" "$INIT_SYSTEM"
-    printf '  5. проверить, что порт %s слушается на %s\n' "$LISTEN_PORT" "$LISTEN_IP"
+    if (( NOPERSIST )); then
+        printf '  4. сервис не создавать (--no-persist)\n'
+    else
+        printf '  4. host1: оформить сервис %s (%s)\n' "$NAME" "$INIT_SYSTEM"
+        printf '  5. проверить, что порт %s слушается на %s\n' "$LISTEN_PORT" "$(fmt_addr "$LISTEN_IP")"
+    fi
     printf '\nКоманда туннеля (<HOME>, <u1>, <u2> заменятся на реальные значения):\n\n'
     printf '  ssh %s\n' "$SSH_ARGS_STR"
+
+    (( NOPERSIST )) && return 0
 
     printf '\nШаблон сервиса (%s):\n\n' "$INIT_SYSTEM"
     if [[ $INIT_SYSTEM == systemd ]]; then
@@ -1680,7 +1778,10 @@ main() {
 
     # Менеджер сервисов проверяем до любых изменений на хостах: незачем
     # создавать ключ и править authorized_keys, если сервис всё равно некуда ставить.
-    detect_init
+    # В режиме --no-persist сервис не нужен, поэтому менеджер не важен.
+    if (( ! NOPERSIST )); then
+        detect_init
+    fi
 
     if (( TEARDOWN )); then
         H1_HOME=$(remote_out "$H1_LOGIN" <<'REMOTE' || true
@@ -1697,21 +1798,31 @@ REMOTE
     # ssh-команда собирается после whoami на host2: имя пользователя нужно точное
     build_ssh_args
     stage_known_hosts
-    stage_persistence
-    do_verify
+    if (( NOPERSIST )); then
+        log "  режим --no-persist: сервис не создаю, туннель остаётся ручным"
+    else
+        stage_persistence
+        do_verify
+    fi
 
     # В history.success попадает только то, что действительно заработало:
     # systemd -- запущенный сервис и слушающийся порт; openrc -- файлы,
     # готовые к установке root-ом (проверить туннель до установки нельзя).
-    if [[ ${SERVICE_START:-} == started && $VERIFY_OK == 1 ]]; then
-        history_log_success ok "$SERVICE_FILE"
-    elif [[ ${SERVICE_START:-} == need-root ]]; then
-        history_log_success prepared "$OPENRC_INIT_PATH"
+    # Без сервиса (--no-persist) записывать нечего.
+    if (( ! NOPERSIST )); then
+        if [[ ${SERVICE_START:-} == started && $VERIFY_OK == 1 ]]; then
+            history_log_success ok "$SERVICE_FILE"
+        elif [[ ${SERVICE_START:-} == need-root ]]; then
+            history_log_success prepared "$OPENRC_INIT_PATH"
+        fi
     fi
 
     print_memo
 
-    printf '\nКоманда туннеля (выполняется на host1):\n\n  ssh %s\n' "$SSH_ARGS_STR"
+    # В режиме --no-persist команда туннеля уже напечатана в памятке.
+    if (( ! NOPERSIST )); then
+        printf '\nКоманда туннеля (выполняется на host1):\n\n  ssh %s\n' "$SSH_ARGS_STR"
+    fi
 }
 
 # История пишется на выходе: так в неё попадают и штатные запуски, и ошибки.
