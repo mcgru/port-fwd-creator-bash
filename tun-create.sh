@@ -44,10 +44,15 @@
 #   -f, --force            перезаписать чужой юнит и обновить опции строки ключа
 #       --teardown, --remove
 #                          снять сервис на host1 (строку ключа не трогает)
+#       --check            только проверить, настроен ли туннель (ничего не меняет)
+#       --history          показать все успешные создания из history.success
 #   -d, --dry-run          показать план и ничего не делать
 #   -v, --verbose          печатать выполняемые команды
 #   -h, --help             справка
 #       --version          версия скрипта
+#
+# История работы пишется на управляющем хосте в ~/.local/share/tun-create/:
+# history.run -- все запуски, history.success -- успешные создания туннелей.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -73,7 +78,22 @@ DRY_RUN=0
 VERBOSE=0
 FORCE=0
 TEARDOWN=0
+CHECK=0               # --check: только проверка, без изменений
+HISTORY=0             # --history: показать history.success
 STEP_NO=1
+
+# Режим запуска попадает в историю; пусто -- запуск не пишем (help, version).
+RUN_MODE=''
+RUN_START=$SECONDS
+RUN_LOGGED=0
+LAST_ERROR=''
+CHECK_TOTAL=0
+CHECK_FAIL=0
+
+# История работы хранится на управляющем хосте, не на концах туннеля.
+HISTORY_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/tun-create
+HISTORY_RUN=$HISTORY_DIR/history.run
+HISTORY_SUCCESS=$HISTORY_DIR/history.success
 
 # host1/host2, разобранные из аргументов
 E1_USER=''; E1_HOST=''; E1_IP=''; E1_PORT=''
@@ -109,7 +129,14 @@ CTRL_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=ye
 log()  { printf '%s\n' "$*"; }
 step() { printf '\n[%d] %s\n' "$STEP_NO" "$*"; STEP_NO=$((STEP_NO + 1)); }
 warn() { printf 'внимание: %s\n' "$*" >&2; }
-die()  { printf '\nошибка: %s\n' "$*" >&2; exit 1; }
+
+# Текст ошибки сохраняем и для истории, чтобы по history.run было видно причину.
+die() {
+    LAST_ERROR=$*
+    LAST_ERROR=${LAST_ERROR//$'\n'/ }
+    printf '\nошибка: %s\n' "$*" >&2
+    exit 1
+}
 
 usage() {
     # шапка файла и есть справка: печатаем от заголовка до закрывающей линии
@@ -175,6 +202,108 @@ is_loopback() {
 sanitize_name() {
     local n=${1//[^A-Za-z0-9._-]/-}
     printf '%s\n' "${n:-ssh-tun}"
+}
+
+# -----------------------------------------------------------------------------
+# История работы: ~/.local/share/tun-create/history.run -- все запуски,
+# history.success -- успешные создания туннелей. Один запуск -- одна строка.
+# Пишем из EXIT-ловушки, поэтому в историю попадает и аварийный выход через die.
+# -----------------------------------------------------------------------------
+history_prepare() {
+    local file=$1 header
+    if ! mkdir -p "$HISTORY_DIR" 2>/dev/null; then
+        warn "не могу создать $HISTORY_DIR -- история не пишется"
+        return 1
+    fi
+    if [[ -e $file ]]; then
+        return 0
+    fi
+    case $file in
+        "$HISTORY_RUN")
+            header='# время | режим | результат | exit | длительность | сервис | направление | правило | хосты | менеджер | команда'
+            ;;
+        "$HISTORY_SUCCESS")
+            header='# время | статус | сервис | направление | правило | хосты | менеджер | сервисный файл | команда'
+            ;;
+        *)
+            header='#'
+            ;;
+    esac
+    if ! printf '%s\n' "$header" > "$file" 2>/dev/null; then
+        warn "не могу писать $file -- история не пишется"
+        return 1
+    fi
+}
+
+# Правило проброса в виде ip1:port1 -> ip2:port2; годится и до setup_forward.
+hist_rule() {
+    local ip1=${NET_IP1:-${E1_IP:-127.0.0.1}} ip2=${NET_IP2:-${E2_IP:-127.0.0.1}}
+    printf '%s:%s -> %s:%s' "$(fmt_addr "$ip1")" "${E1_PORT:-?}" "$(fmt_addr "$ip2")" "${E2_PORT:-?}"
+}
+
+hist_hosts() { printf '%s -> %s' "${E1_HOST:-?}" "${E2_HOST:-?}"; }
+
+# Командная строка для истории: направление приводим к -L/-R, чтобы в логе не
+# зависеть от того, как его набрали (>>> или -l). Остальные аргументы -- как были.
+history_argv() {
+    local a
+    for a in "${ORIG_ARGS[@]}"; do
+        case $a in
+            '>'|'>>'|'>>>'|'}'|'}}'|'}}}'|-L|-l|--local)   printf '%s\0' '-L' ;;
+            '<'|'<<'|'<<<'|'{'|'{{'|'{{{'|-R|-r|--remote)   printf '%s\0' '-R' ;;
+            *)                                              printf '%s\0' "$a" ;;
+        esac
+    done
+}
+
+hist_cmd() {
+    local -a args=()
+    local a
+    while IFS= read -r -d '' a; do
+        args+=("$a")
+    done < <(history_argv)
+    show_cmd "$SCRIPT_PATH" "${args[@]}"
+}
+
+history_log_run() {
+    local result=$1 rc=$2 dur
+    if ! history_prepare "$HISTORY_RUN"; then
+        return 0
+    fi
+    dur=$(( SECONDS - RUN_START ))
+    printf '%s  %-8s  %-9s  exit=%-3s  %-4s  %-20s  %-4s  %-34s  %-16s  %-8s  %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$RUN_MODE" "$result" "$rc" "${dur}s" \
+        "${NAME:-?}" "${DIRECTION:-?}" "$(hist_rule)" "$(hist_hosts)" "${INIT_SYSTEM:-?}" \
+        "$(hist_cmd)${LAST_ERROR:+ | $LAST_ERROR}" >>"$HISTORY_RUN" 2>/dev/null \
+        || warn "не смог дописать $HISTORY_RUN"
+}
+
+history_log_success() {
+    local status=$1 where=$2
+    if ! history_prepare "$HISTORY_SUCCESS"; then
+        return 0
+    fi
+    printf '%s  %-9s  %-20s  %-4s  %-34s  %-16s  %-8s  %-46s  %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$status" "$NAME" "$DIRECTION" \
+        "$(hist_rule)" "$(hist_hosts)" "$INIT_SYSTEM" "$where" "$(hist_cmd)" \
+        >>"$HISTORY_SUCCESS" 2>/dev/null || warn "не смог дописать $HISTORY_SUCCESS"
+}
+
+# EXIT-ловушка: фиксирует любой запуск, который дошёл до разбора аргументов.
+on_exit() {
+    local rc=$1 result
+    if (( RUN_LOGGED )) || [[ -z $RUN_MODE ]]; then
+        return 0
+    fi
+    RUN_LOGGED=1
+    if (( rc == 0 )); then
+        result=ok
+    elif (( rc > 128 )); then
+        result=interrupted
+    else
+        result=fail
+    fi
+    history_log_run "$result" "$rc"
 }
 
 # -----------------------------------------------------------------------------
@@ -270,7 +399,7 @@ parse_endpoint() {
 
 parse_args() {
     local short='hvdfo:LlRr:n:k:K:O:'
-    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,teardown,remove,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
+    local long='help,version,dry-run,verbose,force,local,remote,systemd,openrc,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:'
     local parsed d v
     local -a parts=()
 
@@ -290,6 +419,8 @@ parse_args() {
             -v|--verbose) VERBOSE=1 ;;
             -f|--force)   FORCE=1 ;;
             --teardown|--remove) TEARDOWN=1 ;;
+            --check)      CHECK=1 ;;
+            --history)    HISTORY=1 ;;
             -L|-l|--local)  set_direction L option ;;
             -R|-r|--remote) set_direction R option ;;
             --systemd) set_init systemd ;;
@@ -323,6 +454,34 @@ parse_args() {
         esac
         shift
     done
+
+    # --history -- самостоятельный режим: читает файл на контроллере и выходит.
+    if (( HISTORY )); then
+        if (( ${#POSITIONAL[@]} > 0 )); then
+            die "--history только читает историю и не принимает адреса хостов"
+        fi
+        if (( CHECK || TEARDOWN || DRY_RUN )); then
+            die "--history несовместим с --check/--teardown/--dry-run"
+        fi
+        return 0
+    fi
+
+    # Режим фиксируем до проверки аргументов: неудачный запуск тоже интересен в истории.
+    if (( CHECK )); then
+        if (( TEARDOWN )); then
+            die "конфликт: --check и --teardown"
+        fi
+        if (( DRY_RUN )); then
+            die "конфликт: --check и --dry-run (проверка и так ничего не меняет)"
+        fi
+        RUN_MODE=check
+    elif (( DRY_RUN )); then
+        RUN_MODE=dry-run
+    elif (( TEARDOWN )); then
+        RUN_MODE=teardown
+    else
+        RUN_MODE=create
+    fi
 
     case ${#POSITIONAL[@]} in
         2)
@@ -986,6 +1145,365 @@ REMOTE
 }
 
 # -----------------------------------------------------------------------------
+# --check: только чтение. Проверяет, что туннель из аргументов настроен:
+# init на host1, доступ, ключ, строка в authorized_keys, known_hosts, сервис
+# и прослушивание порта. Ничего не меняет и не требует root.
+# -----------------------------------------------------------------------------
+check_ok()   { CHECK_TOTAL=$((CHECK_TOTAL + 1)); printf '  ok    %s\n' "$*"; }
+check_no()   { CHECK_TOTAL=$((CHECK_TOTAL + 1)); CHECK_FAIL=$((CHECK_FAIL + 1)); printf '  НЕТ   %s\n' "$*"; }
+check_info() { CHECK_TOTAL=$((CHECK_TOTAL + 1)); printf '  инфо  %s\n' "$*"; }
+
+check_init_match() {
+    local out
+    if ! out=$(remote_out "$H1_LOGIN" <<'REMOTE'
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    echo systemd
+elif command -v rc-service >/dev/null 2>&1 || [ -x /sbin/openrc-run ]; then
+    echo openrc
+else
+    echo unknown
+fi
+REMOTE
+    ); then
+        check_no "host1 $E1_HOST: ssh недоступен, менеджер сервисов не определить"
+        return 0
+    fi
+    out=${out//[[:space:]]/}
+    case $out in
+        "$INIT_SYSTEM") check_ok "менеджер сервисов host1: $out (как запрошено)" ;;
+        systemd) check_no "host1: systemd, а запрошен openrc. Запусти так: $(copy_paste_command --systemd)" ;;
+        openrc)  check_no "host1: openrc, а запрошен systemd. Запусти так: $(copy_paste_command --openrc)" ;;
+        *)       check_no "host1: не нашёл ни systemd, ни openrc" ;;
+    esac
+    return 0
+}
+
+# Доступ к обоим хостам и факты о пользователях/домах, нужные остальным проверкам.
+check_access() {
+    local out line
+    if ! out=$(remote_out "$H1_LOGIN" <<'REMOTE'
+printf 'WHO=%s\nHOME=%s\n' "$(id -un)" "$HOME"
+REMOTE
+    ); then
+        check_no "host1 $H1_LOGIN: ssh недоступен"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            WHO=*)  H1_USER=${line#WHO=} ;;
+            HOME=*) H1_HOME=${line#HOME=} ;;
+        esac
+    done <<<"$out"
+    check_ok "host1: доступ по ssh есть (пользователь ${H1_USER:-?})"
+
+    if ! out=$(remote_out "$H2_LOGIN" <<'REMOTE'
+printf 'WHO=%s\nHOME=%s\n' "$(id -un)" "$HOME"
+REMOTE
+    ); then
+        check_no "host2 $H2_LOGIN: ssh недоступен"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            WHO=*)  H2_USER=${line#WHO=} ;;
+            HOME=*) H2_HOME=${line#HOME=} ;;
+        esac
+    done <<<"$out"
+    check_ok "host2: доступ по ssh есть (пользователь ${H2_USER:-?})"
+    return 0
+}
+
+check_key() {
+    if [[ -z $H1_HOME ]]; then
+        check_info "ключ на host1: пропущено, host1 недоступен"
+        return 0
+    fi
+    local out line state='' key='' pub=''
+    if ! out=$(remote_out "$H1_LOGIN" "$KEY_PATH" <<'REMOTE'
+set -u
+key=${1:-}
+case $key in
+    '')    key="$HOME/.ssh/id_ed25519" ;;
+    '~/'*) key="$HOME/${key#\~/}" ;;
+    /*)    : ;;
+    *)     key="$HOME/.ssh/$key" ;;
+esac
+printf 'KEY=%s\n' "$key"
+if [ ! -f "$key" ]; then echo 'STATE=absent'; exit 0; fi
+if ! pub=$(ssh-keygen -y -P '' -f "$key" 2>/dev/null); then
+    echo 'STATE=locked'
+    exit 0
+fi
+if [ -f "$key.pub" ]; then publine=$(cat "$key.pub"); else publine=$pub; fi
+printf 'STATE=ok\nPUB=%s\n' "$publine"
+REMOTE
+    ); then
+        check_no "ключ на host1: не смог проверить"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            KEY=*)   key=${line#KEY=} ;;
+            STATE=*) state=${line#STATE=} ;;
+            PUB=*)   pub=${line#PUB=} ;;
+        esac
+    done <<<"$out"
+
+    local rest
+    case $state in
+        ok)
+            H1_KEY_PATH=$key
+            H1_PUB=$pub
+            H1_PTYPE=${pub%% *}
+            rest=${pub#* }
+            H1_PBLOB=${rest%% *}
+            check_ok "ключ на host1: $key (без пароля)"
+            ;;
+        absent) check_no "ключ на host1 отсутствует: $key (создастся при запуске без --check)" ;;
+        locked) check_no "ключ на host1 защищён паролем: $key -- сервис его не использует" ;;
+        *)      check_no "ключ на host1: непонятный ответ" ;;
+    esac
+    return 0
+}
+
+check_authorized_keys() {
+    if [[ -z $H1_PBLOB ]]; then
+        check_info "строка ключа на host2: пропущено, публичный ключ host1 неизвестен"
+        return 0
+    fi
+    if [[ -z $H2_USER ]]; then
+        check_info "строка ключа на host2: пропущено, host2 недоступен"
+        return 0
+    fi
+    local out line state='' permit='' cmdopt=''
+    if ! out=$(remote_out "$H2_LOGIN" "$H1_PBLOB" "$PERMIT_KIND=\"$PERMIT_VALUE\"" <<'REMOTE'
+set -u
+ak="$HOME/.ssh/authorized_keys"
+if [ ! -f "$ak" ]; then echo 'STATE=absent'; exit 0; fi
+line=$(grep -F -- "$1" "$ak" 2>/dev/null | head -n 1 || true)
+if [ -z "$line" ]; then echo 'STATE=absent'; exit 0; fi
+printf 'STATE=found\nLINE=%s\n' "$line"
+case $line in *"$2"*) echo 'PERMIT=yes' ;; *) echo 'PERMIT=no' ;; esac
+case $line in *command=*) echo 'CMDOPT=yes' ;; *) echo 'CMDOPT=no' ;; esac
+REMOTE
+    ); then
+        check_no "строка ключа на host2: не смог прочитать authorized_keys"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            STATE=*)  state=${line#STATE=} ;;
+            PERMIT=*) permit=${line#PERMIT=} ;;
+            CMDOPT=*) cmdopt=${line#CMDOPT=} ;;
+            LINE=*)   printf '  строка: %s\n' "${line#LINE=}" ;;
+        esac
+    done <<<"$out"
+
+    case $state in
+        absent) check_no "строка ключа на host2 отсутствует в authorized_keys" ;;
+        found)
+            if [[ $cmdopt == yes ]]; then
+                check_no "строка ключа на host2 содержит command=... -- проброс не поднимется"
+            elif [[ $permit == yes ]]; then
+                check_ok "строка ключа на host2 есть с $PERMIT_KIND=\"$PERMIT_VALUE\""
+            else
+                check_no "ключ на host2 есть, но без $PERMIT_KIND=\"$PERMIT_VALUE\" (исправить: запусти с --force)"
+            fi
+            ;;
+        *) check_no "строка ключа на host2: непонятный ответ" ;;
+    esac
+    return 0
+}
+
+check_known_hosts() {
+    if [[ -z $H1_HOME ]]; then
+        check_info "known_hosts на host1: пропущено, host1 недоступен"
+        return 0
+    fi
+    local out
+    if ! out=$(remote_out "$H1_LOGIN" "$H2_CANON_HOST" "$H2_SSH_PORT" <<'REMOTE'
+set -u
+host=$1; port=$2
+kh="$HOME/.ssh/known_hosts"
+if [ ! -f "$kh" ]; then echo missing; exit 0; fi
+# ssh-keygen -F понимает и хэшированные записи; '--' старые версии не принимают.
+if ssh-keygen -F "$host" -f "$kh" >/dev/null 2>&1; then echo present; exit 0; fi
+if ssh-keygen -F "[$host]:$port" -f "$kh" >/dev/null 2>&1; then echo present; exit 0; fi
+echo missing
+REMOTE
+    ); then
+        check_no "known_hosts на host1: не смог проверить"
+        return 0
+    fi
+    out=${out//[[:space:]]/}
+    if [[ $out == present ]]; then
+        check_ok "known_hosts на host1: $H2_CANON_HOST есть"
+    else
+        check_no "known_hosts на host1: $H2_CANON_HOST отсутствует (появится при запуске без --check)"
+    fi
+    return 0
+}
+
+check_service() {
+    if [[ -z $H1_HOME ]]; then
+        check_info "сервис на host1: пропущено, host1 недоступен"
+        return 0
+    fi
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        check_service_systemd
+    else
+        check_service_openrc
+    fi
+}
+
+check_service_systemd() {
+    local out line state='' svc_file='' enabled='' active=''
+    if ! out=$(remote_out "$H1_LOGIN" "$NAME" <<'REMOTE'
+set -u
+name=$1
+uid=$(id -u)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+f="$HOME/.config/systemd/user/$name.service"
+if [ ! -f "$f" ]; then echo 'STATE=absent'; exit 0; fi
+printf 'STATE=present\nFILE=%s\n' "$f"
+if command -v systemctl >/dev/null 2>&1; then
+    printf 'ENABLED=%s\n' "$(systemctl --user is-enabled "$name.service" 2>/dev/null || true)"
+    printf 'ACTIVE=%s\n' "$(systemctl --user is-active "$name.service" 2>/dev/null || true)"
+else
+    echo 'ENABLED=unknown'
+    echo 'ACTIVE=unknown'
+fi
+REMOTE
+    ); then
+        check_no "юнит systemd на host1: не смог проверить"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            STATE=*)   state=${line#STATE=} ;;
+            FILE=*)    svc_file=${line#FILE=} ;;
+            ENABLED=*) enabled=${line#ENABLED=} ;;
+            ACTIVE=*)  active=${line#ACTIVE=} ;;
+        esac
+    done <<<"$out"
+
+    case $state in
+        absent)  check_no "юнит systemd отсутствует: ~/.config/systemd/user/$NAME.service" ;;
+        present)
+            if [[ $enabled == enabled && $active == active ]]; then
+                check_ok "юнит systemd включён и запущен: $svc_file"
+            elif [[ -z $enabled || $enabled == unknown || $active == unknown ]]; then
+                check_info "юнит systemd есть ($svc_file), состояние без systemctl --user не определить"
+            elif [[ $enabled != enabled ]]; then
+                check_no "юнит systemd есть, но не включён: systemctl --user enable $NAME.service"
+            else
+                check_no "юнит systemd включён, но не запущен: systemctl --user start $NAME.service"
+            fi
+            ;;
+        *) check_no "юнит systemd: непонятный ответ" ;;
+    esac
+    return 0
+}
+
+check_service_openrc() {
+    local out line prepared='' installed='' status='' detail=''
+    if ! out=$(remote_out "$H1_LOGIN" "$NAME" <<'REMOTE'
+set -u
+name=$1
+d="$HOME/.local/share/$name"
+prepared=no
+if [ -f "$d/init.d/$name" ] && [ -f "$d/conf.d/$name" ]; then prepared=yes; fi
+installed=no
+if [ -f "/etc/init.d/$name" ] && [ -f "/etc/conf.d/$name" ]; then installed=yes; fi
+printf 'PREPARED=%s\nINSTALLED=%s\n' "$prepared" "$installed"
+if [ "$installed" = yes ]; then
+    if st=$(rc-service "$name" status 2>&1); then
+        echo 'STATUS=started'
+    else
+        echo 'STATUS=stopped'
+        printf 'DETAIL=%s\n' "$(printf '%s' "$st" | head -n 1)"
+    fi
+else
+    echo 'STATUS=uninstalled'
+fi
+REMOTE
+    ); then
+        check_no "сервис openrc на host1: не смог проверить"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case $line in
+            PREPARED=*)  prepared=${line#PREPARED=} ;;
+            INSTALLED=*) installed=${line#INSTALLED=} ;;
+            STATUS=*)    status=${line#STATUS=} ;;
+            DETAIL=*)    detail=${line#DETAIL=} ;;
+        esac
+    done <<<"$out"
+
+    if [[ $installed == yes ]]; then
+        case $status in
+            started) check_ok "сервис openrc установлен и запущен: /etc/init.d/$NAME" ;;
+            stopped)
+                if [[ $detail == *root* ]]; then
+                    check_info "сервис openrc установлен; статус без root не узнать (rc-service $NAME status)"
+                else
+                    check_no "сервис openrc установлен, но не запущен (root: rc-service $NAME start)"
+                fi
+                ;;
+            *) check_info "сервис openrc установлен; статус не определить" ;;
+        esac
+    elif [[ $prepared == yes ]]; then
+        check_no "файлы сервиса openrc подготовлены, но не установлены: нужен root (install в /etc + rc-update add $NAME default)"
+    else
+        check_no "сервис openrc не подготовлен на host1"
+    fi
+    return 0
+}
+
+check_port() {
+    local out
+    if ! out=$(remote_out "$LISTEN_TARGET" "$LISTEN_PORT" <<'REMOTE'
+set -u
+port=$1
+if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :$port" 2>/dev/null
+elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true
+fi
+REMOTE
+    ); then
+        check_no "порт ${LISTEN_PORT} на ${LISTEN_TARGET}: не смог проверить"
+        return 0
+    fi
+    if [[ -n ${out//[[:space:]]/} ]]; then
+        check_ok "порт ${LISTEN_PORT} слушается на ${LISTEN_IP} (${LISTEN_TARGET##*@})"
+    else
+        check_no "порт ${LISTEN_PORT} на ${LISTEN_IP} не слушается"
+    fi
+    return 0
+}
+
+do_check() {
+    step "Проверяю, настроен ли туннель ${NAME} (только чтение)"
+    check_init_match
+    check_access
+    check_key
+    check_authorized_keys
+    check_known_hosts
+    check_service
+    check_port
+
+    printf '\nПроверок: %d, проблем: %d\n' "$CHECK_TOTAL" "$CHECK_FAIL"
+    if (( CHECK_FAIL == 0 )); then
+        log "Туннель ${NAME} настроен."
+        return 0
+    fi
+    warn "туннель ${NAME} настроен не полностью (проблем: $CHECK_FAIL)"
+    return 1
+}
+
+# -----------------------------------------------------------------------------
 # Памятка для root: готовые блоки через пустую строку
 # -----------------------------------------------------------------------------
 print_memo() {
@@ -1107,6 +1625,25 @@ print_dry_run() {
 }
 
 # -----------------------------------------------------------------------------
+# --history: показать все успешные создания туннелей из history.success
+# -----------------------------------------------------------------------------
+print_history() {
+    local rows
+    if [[ ! -f $HISTORY_SUCCESS ]]; then
+        log "Успешных созданий пока нет: файла $HISTORY_SUCCESS ещё нет."
+        return 0
+    fi
+    rows=$(grep -cv '^#' "$HISTORY_SUCCESS" 2>/dev/null || true)
+    if [[ -z $rows || $rows == 0 ]]; then
+        log "Успешных созданий пока нет: $HISTORY_SUCCESS пуст."
+        return 0
+    fi
+    log "Успешные создания туннелей: $HISTORY_SUCCESS (записей: $rows)"
+    printf '\n'
+    cat "$HISTORY_SUCCESS"
+}
+
+# -----------------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------------
 main() {
@@ -1115,9 +1652,20 @@ main() {
     command -v base64 >/dev/null 2>&1 || die "нужен base64 (coreutils)"
 
     parse_args "$@"
+
+    if (( HISTORY )); then
+        print_history
+        return 0
+    fi
+
     resolve_endpoints
     setup_forward
     print_plan
+
+    if (( CHECK )); then
+        do_check && return 0
+        return 1
+    fi
 
     if (( DRY_RUN )); then
         # для наглядности подставляем заглушки вместо того, что узнаём по ssh
@@ -1151,9 +1699,22 @@ REMOTE
     stage_known_hosts
     stage_persistence
     do_verify
+
+    # В history.success попадает только то, что действительно заработало:
+    # systemd -- запущенный сервис и слушающийся порт; openrc -- файлы,
+    # готовые к установке root-ом (проверить туннель до установки нельзя).
+    if [[ ${SERVICE_START:-} == started && $VERIFY_OK == 1 ]]; then
+        history_log_success ok "$SERVICE_FILE"
+    elif [[ ${SERVICE_START:-} == need-root ]]; then
+        history_log_success prepared "$OPENRC_INIT_PATH"
+    fi
+
     print_memo
 
     printf '\nКоманда туннеля (выполняется на host1):\n\n  ssh %s\n' "$SSH_ARGS_STR"
 }
+
+# История пишется на выходе: так в неё попадают и штатные запуски, и ошибки.
+trap 'on_exit $?' EXIT
 
 main "$@"
