@@ -872,6 +872,7 @@ else
     echo 'RESULT=start-failed'
 fi
 printf 'LINGER=%s\n' "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo unknown)"
+# mc "
 REMOTE
     ); then
         warn "не смог запустить сервис на host1, смотри памятку ниже"
@@ -1005,6 +1006,7 @@ print_memo() {
         fi
     else
         printf '\nФайлы сервиса подготовлены на host1 в %s\n' "$(dirname "$(dirname "$OPENRC_INIT_PATH")")"
+# mc "
         printf '\nУстановить сервис (root на host1 %s):\n\n' "$E1_HOST"
         printf 'install -m 755 %s /etc/init.d/%s\n' "$OPENRC_INIT_PATH" "$NAME"
         printf 'install -m 644 %s /etc/conf.d/%s\n' "$OPENRC_CONF_PATH" "$NAME"
