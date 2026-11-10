@@ -1,4 +1,4 @@
-# tun-create.sh
+# port-fwd-creator.sh
 
 Один самодостаточный bash-скрипт, который настраивает постоянный SSH-туннель
 между двумя хостами. Запускается с управляющего хоста (ноутбука): сам ходит
@@ -45,24 +45,24 @@
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/mcgru/tun-creator-bash.git
-cd tun-creator-bash
-chmod +x tun-create.sh
+git clone https://github.com/mcgru/port-fwd-creator-bash.git
+cd port-fwd-creator-bash
+chmod +x port-fwd-creator.sh
 
 # слушать на host1 в 127.0.0.1:18080, проброс на sshd host2
-./tun-create.sh sss:127.0.0.1:18080 -L ttt:127.0.0.1:22
+./port-fwd-creator.sh sss:127.0.0.1:18080 -L ttt:127.0.0.1:22
 
 # то же с токеном направления
-./tun-create.sh sss:127.0.0.1:18080 '}}}' ttt:127.0.0.1:22
+./port-fwd-creator.sh sss:127.0.0.1:18080 '}}}' ttt:127.0.0.1:22
 
 # слушать на host2 в 172.17.0.1:3333, проброс на sshd host1
-./tun-create.sh sss:172.17.0.1:22 '{{' ttt:172.17.0.1:3333
+./port-fwd-creator.sh sss:172.17.0.1:22 '{{' ttt:172.17.0.1:3333
 
 # явные пользователи, пустой IP -- это loopback
-./tun-create.sh smelov@sss::8080 '>>>' tun-user@ttt::22
+./port-fwd-creator.sh smelov@sss::8080 '>>>' tun-user@ttt::22
 
 # на host1 openrc вместо systemd
-./tun-create.sh ggg::18080 '}}}' hhh::22 --openrc
+./port-fwd-creator.sh ggg::18080 '}}}' hhh::22 --openrc
 ```
 
 После успешного запуска туннель оформлен на host1 как включённый сервис,
@@ -73,28 +73,28 @@ openrc) и точную ssh-команду, которой пользуется 
 
 ```bash
 # посмотреть, что будет сделано, не трогая хосты
-./tun-create.sh sss::18080 -L ttt::22 --dry-run
+./port-fwd-creator.sh sss::18080 -L ttt::22 --dry-run
 
 # настроить ключ, authorized_keys и known_hosts, но сервис не создавать
-./tun-create.sh sss::18080 -L ttt::22 --no-persist
+./port-fwd-creator.sh sss::18080 -L ttt::22 --no-persist
 
 # проверить готовый туннель, ничего не меняя
-./tun-create.sh sss::18080 -L ttt::22 --check
+./port-fwd-creator.sh sss::18080 -L ttt::22 --check
 
 # снять сервис (строка ключа в authorized_keys остаётся)
-./tun-create.sh sss::18080 -L ttt::22 --teardown
+./port-fwd-creator.sh sss::18080 -L ttt::22 --teardown
 
 # показать успешные создания
-./tun-create.sh --history
+./port-fwd-creator.sh --history
 
 # в агенте много ключей -- фиксируем ключ контроллера
-./tun-create.sh sss::18080 -L ttt::22 -K ~/.ssh/id_ed25519
+./port-fwd-creator.sh sss::18080 -L ttt::22 -K ~/.ssh/id_ed25519
 
 # доп. опции ssh для туннеля (каждая станет своим -o)
-./tun-create.sh sss::18080 -L ttt::22 -o 'Compression=yes ServerAliveInterval=15'
+./port-fwd-creator.sh sss::18080 -L ttt::22 -o 'Compression=yes ServerAliveInterval=15'
 
 # своё имя сервиса и свой ключ на host1
-./tun-create.sh sss::18080 -L ttt::22 -n my-tunnel -k ~/.ssh/id_tunnel
+./port-fwd-creator.sh sss::18080 -L ttt::22 -n my-tunnel -k ~/.ssh/id_tunnel
 ```
 
 ### Адреса через опции
@@ -104,14 +104,14 @@ openrc) и точную ssh-команду, которой пользуется 
 
 ```bash
 # без позиционных аргументов вообще
-./tun-create.sh --from sss:127.0.0.1:18080 --to ttt:127.0.0.1:22 -L
+./port-fwd-creator.sh --from sss:127.0.0.1:18080 --to ttt:127.0.0.1:22 -L
 
 # недостающую сторону можно оставить аргументом
-./tun-create.sh --from sss::18080 ttt::22 -L
-./tun-create.sh sss::18080 --to ttt::22 -L
+./port-fwd-creator.sh --from sss::18080 ttt::22 -L
+./port-fwd-creator.sh sss::18080 --to ttt::22 -L
 
 # опция перекрывает аргумент: host2 здесь ttt:22, а не 9.9.9.9:22
-./tun-create.sh sss::18080 -L ttt:9.9.9.9:22 --to ttt:127.0.0.1:22
+./port-fwd-creator.sh sss::18080 -L ttt:9.9.9.9:22 --to ttt:127.0.0.1:22
 ```
 
 ### Повтор успешного запуска: --run
@@ -132,13 +132,13 @@ openrc) и точную ssh-команду, которой пользуется 
 
 ```bash
 # повторить самый свежий успешный запуск с секундами 59
-./tun-create.sh --run 59
+./port-fwd-creator.sh --run 59
 
 # повторить его, но слушать на другом адресе/порту host2
-./tun-create.sh --run 59 --to ttt:172.17.0.1:4444 --no-persist
+./port-fwd-creator.sh --run 59 --to ttt:172.17.0.1:4444 --no-persist
 
 # повторить с противоположным направлением
-./tun-create.sh --run 59 -L
+./port-fwd-creator.sh --run 59 -L
 ```
 
 Перед реальными действиями скрипт печатает найденный момент и итоговую
@@ -167,7 +167,7 @@ Enter, y или yes запускают; n, любой другой ответ и
    Публичная часть живёт только в памяти.
 5. host2: whoami, поиск ключа в authorized_keys по телу. Если строки нет,
    дописывает restrict,port-forwarding,permitopen|permitlisten="ip2:port2".
-   Своя строка (комментарий tun-create:...) обновляется при смене правила;
+   Своя строка (комментарий port-fwd-creator:...) обновляется при смене правила;
    чужая с другими опциями -- ошибка, пока не дан --force.
 6. host1: первым коннектом на host2 заполняет known_hosts.
 7. Собирает ssh-команду: -N -T, BatchMode, ExitOnForwardFailure,
@@ -204,8 +204,8 @@ rc-service <name> start
 
 ## История
 
-На управляющем хосте, в ~/.local/share/tun-create/
-(или $XDG_DATA_HOME/tun-create/):
+На управляющем хосте, в ~/.local/share/port-fwd-creator/
+(или $XDG_DATA_HOME/port-fwd-creator/):
 
 - history.run -- каждый запуск, включая ошибки и прерывания;
 - history.success -- только успешные создания: ok, когда сервис systemd
@@ -238,10 +238,10 @@ rc-service <name> start
 ## Состав репозитория
 
 ```text
-tun-create.sh   скрипт
-PRD.md          постановка, решения, критерии приёмки, журнал проверок
-DIALOGUE.md     переписка, по которой делался инструмент
-todo            исходная постановка
-README.md       английская версия
-README.ru.md    этот файл
+port-fwd-creator.sh  скрипт
+PRD.md               постановка, решения, критерии приёмки, журнал проверок
+DIALOGUE.md          переписка, по которой делался инструмент
+todo                 исходная постановка
+README.md            английская версия
+README.ru.md         этот файл
 ```

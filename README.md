@@ -1,4 +1,4 @@
-# tun-create.sh
+# port-fwd-creator.sh
 
 A single self-contained bash script that sets up a persistent SSH tunnel
 between two hosts. Run it from your control machine (laptop): it connects to
@@ -46,24 +46,24 @@ Quote tokens containing `>` in the shell, otherwise it is a redirect.
 ## Quick start
 
 ```bash
-git clone https://github.com/mcgru/tun-creator-bash.git
-cd tun-creator-bash
-chmod +x tun-create.sh
+git clone https://github.com/mcgru/port-fwd-creator-bash.git
+cd port-fwd-creator-bash
+chmod +x port-fwd-creator.sh
 
 # listen on host1 at 127.0.0.1:18080, forward to host2's sshd
-./tun-create.sh sss:127.0.0.1:18080 -L ttt:127.0.0.1:22
+./port-fwd-creator.sh sss:127.0.0.1:18080 -L ttt:127.0.0.1:22
 
 # the same with a direction token
-./tun-create.sh sss:127.0.0.1:18080 '}}}' ttt:127.0.0.1:22
+./port-fwd-creator.sh sss:127.0.0.1:18080 '}}}' ttt:127.0.0.1:22
 
 # listen on host2 at 172.17.0.1:3333, forward to host1's sshd
-./tun-create.sh sss:172.17.0.1:22 '{{' ttt:172.17.0.1:3333
+./port-fwd-creator.sh sss:172.17.0.1:22 '{{' ttt:172.17.0.1:3333
 
 # explicit users, empty IP means loopback
-./tun-create.sh smelov@sss::8080 '>>>' tun-user@ttt::22
+./port-fwd-creator.sh smelov@sss::8080 '>>>' tun-user@ttt::22
 
 # host1 runs openrc instead of systemd
-./tun-create.sh ggg::18080 '}}}' hhh::22 --openrc
+./port-fwd-creator.sh ggg::18080 '}}}' hhh::22 --openrc
 ```
 
 After a successful run, the tunnel is an enabled service on host1 and the
@@ -74,28 +74,28 @@ and the exact ssh command it uses.
 
 ```bash
 # see what would happen without touching the hosts
-./tun-create.sh sss::18080 -L ttt::22 --dry-run
+./port-fwd-creator.sh sss::18080 -L ttt::22 --dry-run
 
 # configure key, authorized_keys and known_hosts, but create no service
-./tun-create.sh sss::18080 -L ttt::22 --no-persist
+./port-fwd-creator.sh sss::18080 -L ttt::22 --no-persist
 
 # check an existing tunnel without changing anything
-./tun-create.sh sss::18080 -L ttt::22 --check
+./port-fwd-creator.sh sss::18080 -L ttt::22 --check
 
 # remove the service (the key line in authorized_keys is kept)
-./tun-create.sh sss::18080 -L ttt::22 --teardown
+./port-fwd-creator.sh sss::18080 -L ttt::22 --teardown
 
 # list successful creations
-./tun-create.sh --history
+./port-fwd-creator.sh --history
 
 # too many keys in the agent -> pin the controller key
-./tun-create.sh sss::18080 -L ttt::22 -K ~/.ssh/id_ed25519
+./port-fwd-creator.sh sss::18080 -L ttt::22 -K ~/.ssh/id_ed25519
 
 # extra ssh options for the tunnel (each becomes its own -o)
-./tun-create.sh sss::18080 -L ttt::22 -o 'Compression=yes ServerAliveInterval=15'
+./port-fwd-creator.sh sss::18080 -L ttt::22 -o 'Compression=yes ServerAliveInterval=15'
 
 # custom service name and key on host1
-./tun-create.sh sss::18080 -L ttt::22 -n my-tunnel -k ~/.ssh/id_tunnel
+./port-fwd-creator.sh sss::18080 -L ttt::22 -n my-tunnel -k ~/.ssh/id_tunnel
 ```
 
 ### Endpoints via options
@@ -105,14 +105,14 @@ stronger than positional arguments: if both are present, the option wins.
 
 ```bash
 # no positional arguments at all
-./tun-create.sh --from sss:127.0.0.1:18080 --to ttt:127.0.0.1:22 -L
+./port-fwd-creator.sh --from sss:127.0.0.1:18080 --to ttt:127.0.0.1:22 -L
 
 # one missing side can stay positional
-./tun-create.sh --from sss::18080 ttt::22 -L
-./tun-create.sh sss::18080 --to ttt::22 -L
+./port-fwd-creator.sh --from sss::18080 ttt::22 -L
+./port-fwd-creator.sh sss::18080 --to ttt::22 -L
 
 # the option overrides the argument: host2 here is ttt:22, not 9.9.9.9:22
-./tun-create.sh sss::18080 -L ttt:9.9.9.9:22 --to ttt:127.0.0.1:22
+./port-fwd-creator.sh sss::18080 -L ttt:9.9.9.9:22 --to ttt:127.0.0.1:22
 ```
 
 ### Replay a successful run: --run
@@ -133,13 +133,13 @@ applied on top; the current options win:
 
 ```bash
 # replay the newest successful run at xx:xx:59
-./tun-create.sh --run 59
+./port-fwd-creator.sh --run 59
 
 # replay it, but listen on another address/port on host2
-./tun-create.sh --run 59 --to ttt:172.17.0.1:4444 --no-persist
+./port-fwd-creator.sh --run 59 --to ttt:172.17.0.1:4444 --no-persist
 
 # replay it with the opposite direction
-./tun-create.sh --run 59 -L
+./port-fwd-creator.sh --run 59 -L
 ```
 
 Before anything real happens the script prints the matched timestamp and the
@@ -169,7 +169,7 @@ Positional addresses are not accepted together with `--run`; use `--from` /
 5. host2: `whoami`, then finds the key in `authorized_keys` by its body. If the
    line is missing, it appends
    `restrict,port-forwarding,permitopen|permitlisten="ip2:port2"`. Its own line
-   (comment `tun-create:...`) is updated when the rule changes; a foreign line
+   (comment `port-fwd-creator:...`) is updated when the rule changes; a foreign line
    with different options is an error unless `--force` is given.
 6. host1: fills `known_hosts` with the first connection to host2.
 7. Builds the ssh command: `-N -T`, BatchMode, ExitOnForwardFailure,
@@ -205,8 +205,8 @@ rc-service <name> start
 
 ## History
 
-On the control machine, under `~/.local/share/tun-create/`
-(or `$XDG_DATA_HOME/tun-create/`):
+On the control machine, under `~/.local/share/port-fwd-creator/`
+(or `$XDG_DATA_HOME/port-fwd-creator/`):
 
 - `history.run` — every run, including failures and interrupts;
 - `history.success` — only successful creations: `ok` when the systemd service
@@ -238,10 +238,10 @@ Both files store the full command line with the direction normalized to
 ## Repository layout
 
 ```text
-tun-create.sh   the script
-PRD.md          requirements, decisions, acceptance criteria, test log
-DIALOGUE.md     the conversation that shaped the tool (Russian)
-todo            original task statement (Russian)
-README.md       this file
-README.ru.md    Russian version
+port-fwd-creator.sh  the script
+PRD.md               requirements, decisions, acceptance criteria, test log
+DIALOGUE.md          the conversation that shaped the tool (Russian)
+todo                 original task statement (Russian)
+README.md            this file
+README.ru.md         Russian version
 ```

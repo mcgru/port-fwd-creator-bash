@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tun-create.sh -- настройка ssh-туннеля между двумя хостами
+# port-fwd-creator.sh -- настройка ssh-туннеля между двумя хостами
 #
 # Запускается с управляющего хоста (ноутбука): сам ходит по ssh на оба конца,
 # готовит ключ, authorized_keys, known_hosts, оформляет туннель в постоянный
@@ -9,12 +9,12 @@
 #
 # Форматы запуска (эквивалентные):
 #
-#   tun-create.sh [u1@]host1:ip1:port1 <направление> u2@host2:ip2:port2 [опции]
-#   tun-create.sh u1@host1:127.0.0.1:8080 -R u2@host2:127.0.0.1:80
-#   tun-create.sh host1::8080 '}}}' host2::80 --openrc
-#   tun-create.sh u1@host1:127.0.0.1:8080 "<<<" u2@host2:10.0.0.5:80 --dry-run
-#   tun-create.sh --from sss::18080 --to ttt::22 -L --no-persist
-#   tun-create.sh --run 4459 --to ttt::172.17.0.1:4444
+#   port-fwd-creator.sh [u1@]host1:ip1:port1 <направление> u2@host2:ip2:port2 [опции]
+#   port-fwd-creator.sh u1@host1:127.0.0.1:8080 -R u2@host2:127.0.0.1:80
+#   port-fwd-creator.sh host1::8080 '}}}' host2::80 --openrc
+#   port-fwd-creator.sh u1@host1:127.0.0.1:8080 "<<<" u2@host2:10.0.0.5:80 --dry-run
+#   port-fwd-creator.sh --from sss::18080 --to ttt::22 -L --no-persist
+#   port-fwd-creator.sh --run 4459 --to ttt::172.17.0.1:4444
 #
 # Направление -- это то, с какой стороны слушается порт, то есть какой флаг
 # уйдёт в ssh. Само ssh-соединение туннеля всегда инициируется с host1 на host2.
@@ -70,7 +70,7 @@
 #   -h, --help             справка
 #       --version          версия скрипта
 #
-# История работы пишется на управляющем хосте в ~/.local/share/tun-create/:
+# История работы пишется на управляющем хосте в ~/.local/share/port-fwd-creator/:
 # history.run -- все запуски, history.success -- успешные создания туннелей.
 # =============================================================================
 
@@ -119,7 +119,7 @@ CHECK_TOTAL=0
 CHECK_FAIL=0
 
 # История работы хранится на управляющем хосте, не на концах туннеля.
-HISTORY_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/tun-create
+HISTORY_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/port-fwd-creator
 HISTORY_RUN=$HISTORY_DIR/history.run
 HISTORY_SUCCESS=$HISTORY_DIR/history.success
 
@@ -168,7 +168,7 @@ die() {
 
 usage() {
     # шапка файла и есть справка: печатаем от заголовка до закрывающей линии
-    sed -n '/^# tun-create.sh/,/^# =====/p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+    sed -n '/^# port-fwd-creator.sh/,/^# =====/p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
 }
 
 # -----------------------------------------------------------------------------
@@ -233,7 +233,7 @@ sanitize_name() {
 }
 
 # -----------------------------------------------------------------------------
-# История работы: ~/.local/share/tun-create/history.run -- все запуски,
+# История работы: ~/.local/share/port-fwd-creator/history.run -- все запуски,
 # history.success -- успешные создания туннелей. Один запуск -- одна строка.
 # Пишем из EXIT-ловушки, поэтому в историю попадает и аварийный выход через die.
 # -----------------------------------------------------------------------------
@@ -943,7 +943,7 @@ chmod 700 "$HOME/.ssh" 2>/dev/null || true
 
 if [ ! -f "$key" ]; then
     command -v ssh-keygen >/dev/null 2>&1 || { echo "ERR на $(hostname -s) нет ssh-keygen"; exit 3; }
-    ssh-keygen -q -t ed25519 -N '' -C "tun-create:$(id -un)@$(hostname -s)" -f "$key" >/dev/null 2>&1 \
+    ssh-keygen -q -t ed25519 -N '' -C "port-fwd-creator:$(id -un)@$(hostname -s)" -f "$key" >/dev/null 2>&1 \
         || { echo "ERR ssh-keygen не смог создать $key"; exit 3; }
     state=created
 else
@@ -1004,7 +1004,7 @@ REMOTE
 stage_authorized_keys() {
     step "host2 ($H2_LOGIN): проверяю строку ключа в authorized_keys"
 
-    local comment="tun-create:${H1_USER}@${E1_HOST}->${E2_HOST}:${E2_PORT}"
+    local comment="port-fwd-creator:${H1_USER}@${E1_HOST}->${E2_HOST}:${E2_PORT}"
     local out
     if ! out=$(remote_out "$H2_LOGIN" "$PERMIT_OPTS" "$H1_PTYPE" "$H1_PBLOB" "$comment" "$PERMIT_KIND=\"$PERMIT_VALUE\"" "$FORCE" <<'REMOTE'
 set -u
@@ -1029,13 +1029,13 @@ else
     case $line in
         *"$req"*) printf 'RESULT=exists\n' ;;
         *)
-            # Строку, созданную этим скриптом, узнаём по комментарию tun-create:
+            # Строку, созданную этим скриптом, узнаём по комментарию port-fwd-creator:
             # её можно обновлять без --force, она целиком наша. Чужую строку
             # трогаем только по явному --force.
             suffix=${line#*" $ptype $pblob"}
             suffix=${suffix# }
             case $suffix in
-                tun-create:*) owner=ours ;;
+                port-fwd-creator:*) owner=ours ;;
                 *)            owner=foreign ;;
             esac
             if [ "$force" = 1 ] || [ "$owner" = ours ]; then
@@ -1091,7 +1091,7 @@ REMOTE
         forced)     log "  чужая строка ключа переписана под $PERMIT_OPTS (--force)" ;;
         restricted)
             die "ключ на host2 уже прописан с другими опциями, а нужного $PERMIT_KIND=\"$PERMIT_VALUE\" нет.
-Строка принадлежит не tun-create, поэтому без --force её не трогаю.
+Строка принадлежит не port-fwd-creator, поэтому без --force её не трогаю.
 Либо запусти с --force (строка будет переписана), либо поправь её на host2 руками."
             ;;
         *) die "непонятный результат этапа authorized_keys: ${result:-пусто}" ;;
