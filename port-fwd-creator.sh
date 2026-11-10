@@ -60,11 +60,18 @@
 #                          совпадение; адреса и опции берутся из истории, но
 #                          текущие опции главнее: --from/--to, -L/-R,
 #                          --no-persist и прочие применяются поверх.
-#                          Позиционные адреса с --run не указываются.
+#                          Позиционные адреса с --run/--last не указываются.
 #                          Перед реальным запуском показывает найденный момент
 #                          и итоговую команду, затем спрашивает
-#                          "Запускаем? [Y/n]": Enter или y -- запуск, n или
+#                          "Run? [Y/n]": Enter или y -- запуск, n или
 #                          Ctrl+C -- отмена. С --dry-run и --check не спрашивает.
+#       --last <N>         повторить N-ю с конца запись history.success:
+#                          N=1 или 0 -- последняя, N=2 -- предпоследняя и так
+#                          далее; отрицательное N считается положительным.
+#                          Остальное как у --run: адреса и опции берутся из
+#                          истории, текущие опции главнее, перед реальным
+#                          запуском печатается запись и спрашивается
+#                          "Run? [Y/n]". С --run несовместим.
 #   -d, --dry-run          показать план и ничего не делать
 #   -v, --verbose          печатать выполняемые команды
 #   -h, --help             справка
@@ -81,10 +88,10 @@ SCRIPT_VERSION='0.1.0'
 SCRIPT_PATH=$0
 ORIG_ARGS=("$@")
 
-# Набор опций для getopt: им же канонизируются аргументы из истории (--run),
-# поэтому список живёт в одном месте.
+# Набор опций для getopt: им же канонизируются аргументы из истории
+# (--run/--last), поэтому список живёт в одном месте.
 OPT_SHORT='hvdfo:LlRr:n:k:K:O:'
-OPT_LONG='help,version,dry-run,verbose,force,local,remote,systemd,openrc,no-persist,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:,from:,to:,run:'
+OPT_LONG='help,version,dry-run,verbose,force,local,remote,systemd,openrc,no-persist,teardown,remove,check,history,name:,key:,ctrl-key:,ctrl-ssh-option:,ssh-option:,from:,to:,run:,last:'
 
 # -----------------------------------------------------------------------------
 # Глобальное состояние (заполняется разбором аргументов и по ходу работы)
@@ -98,6 +105,7 @@ KEY_PATH=''
 FROM_OPT=''           # --from: адрес host1, сильнее позиционного аргумента
 TO_OPT=''             # --to: адрес host2
 RUN_MOMENT=''         # --run: момент успешного запуска из history.success
+LAST_FROM_END=''      # --last: номер записи с конца history.success
 CTRL_KEY=''           # ключ контроллера для заходов на хосты
 CTRL_EXTRA=()         # доп. -o для заходов контроллера
 EXTRA_OPTS=()
@@ -451,6 +459,7 @@ parse_args() {
             --from)       FROM_OPT=$2; shift ;;
             --to)         TO_OPT=$2; shift ;;
             --run)        RUN_MOMENT=$2; shift ;;
+            --last)       LAST_FROM_END=$2; shift ;;
             -L|-l|--local)  set_direction L option ;;
             -R|-r|--remote) set_direction R option ;;
             --systemd) set_init systemd ;;
@@ -485,6 +494,10 @@ parse_args() {
         shift
     done
 
+    if [[ -n $RUN_MOMENT && -n $LAST_FROM_END ]]; then
+        die "конфликт: --run и --last по-разному выбирают запись из истории"
+    fi
+
     # --history -- самостоятельный режим: читает файл на контроллере и выходит.
     if (( HISTORY )); then
         if (( ${#POSITIONAL[@]} > 0 )); then
@@ -493,8 +506,8 @@ parse_args() {
         if (( CHECK || TEARDOWN || DRY_RUN )); then
             die "--history несовместим с --check/--teardown/--dry-run"
         fi
-        if [[ -n $RUN_MOMENT ]]; then
-            die "--history несовместим с --run"
+        if [[ -n $RUN_MOMENT || -n $LAST_FROM_END ]]; then
+            die "--history несовместим с --run/--last"
         fi
         return 0
     fi
@@ -520,11 +533,11 @@ parse_args() {
     fi
 
     local npos=${#POSITIONAL[@]}
-    if [[ -n $RUN_MOMENT ]]; then
-        # Адреса при --run берутся из history.success; текущие --from/--to и
-        # опции -- это оверрайд. Позиционные адреса тут только путали бы.
+    if [[ -n $RUN_MOMENT || -n $LAST_FROM_END ]]; then
+        # Адреса при --run/--last берутся из history.success; текущие
+        # --from/--to и опции -- это оверрайд. Позиционные тут только путали бы.
         if (( npos > 0 )); then
-            die "с --run адреса берутся из истории: используй --from/--to и -L/-R, позиционные аргументы не нужны"
+            die "с --run/--last адреса берутся из истории: используй --from/--to и -L/-R, позиционные аргументы не нужны"
         fi
     else
         case $npos in
@@ -576,8 +589,8 @@ parse_args() {
     DIRECTION=${DIRECTION:-L}
     DIR_SRC=${DIR_SRC:-default}
     INIT_SYSTEM=${INIT_SYSTEM:-systemd}
-    if [[ -n $RUN_MOMENT && -z $E2_HOST ]]; then
-        # адреса ещё не известны -- их принесёт --run; не выдумываем имя
+    if [[ ( -n $RUN_MOMENT || -n $LAST_FROM_END ) && -z $E2_HOST ]]; then
+        # адреса ещё не известны -- их принесёт история; не выдумываем имя
         NAME='?'
     else
         NAME=$(sanitize_name "${NAME:-ssh-tun-${E2_HOST}-${E2_PORT}}")
@@ -622,58 +635,85 @@ opt_name() {
         --from)               printf 'from 1' ;;
         --to)                 printf 'to 1' ;;
         --run)                printf 'run 1' ;;
+        --last)               printf 'last 1' ;;
         *) return 1 ;;
     esac
 }
 
 # -----------------------------------------------------------------------------
-# --run: повтор успешного запуска из history.success
+# --run/--last: повтор успешного запуска из history.success
 #
-# Берём последнюю строку, время которой оканчивается на MOMENT (сс, ммсс или
-# ччммсс; ведущие нули не важны). Команда из строки воспроизводится заново,
-# но текущие опции главнее: --from/--to, -L/-R и прочие перекрывают
-# исторические. Реализация не тащит состояние через глобальные переменные:
-# собираем argv и делаем exec того же скрипта.
+# --run берёт последнюю строку, время которой оканчивается на MOMENT (сс, ммсс
+# или ччммсс; ведущие нули не важны). --last берёт N-ю строку с конца: 0 и 1 --
+# последняя, 2 -- предпоследняя, отрицательное N считается положительным.
+# Команда из строки воспроизводится заново, но текущие опции главнее:
+# --from/--to, -L/-R и прочие перекрывают исторические. Реализация не тащит
+# состояние через глобальные переменные: собираем argv и делаем exec того же
+# скрипта.
 # -----------------------------------------------------------------------------
 run_from_history() {
     local line best='' best_time='' d t rest digits info name cmdline
-    local tail head pre parsed
-    local -a hist_args=() cur=() kept=() pos=() merged=()
+    local tail head pre parsed idx total
+    local -a hist_args=() cur=() kept=() pos=() merged=() lines=()
     local -A cur_opt=()
-    local cur_dir=''
-
-    digits=${RUN_MOMENT//[^0-9]/}
-    [[ -n $digits ]] || die "--run: в MOMENT нет цифр: $RUN_MOMENT"
-    (( ${#digits} <= 6 )) || die "--run: MOMENT длиннее 6 цифр (сс, ммсс или ччммсс): $RUN_MOMENT"
-    # приведение к целому: 02:44:59, 024459 и 24459 -- одно и то же
-    digits=$((10#$digits))
+    local cur_dir='' i ts n
 
     [[ -f $HISTORY_SUCCESS ]] || die "успешных запусков ещё нет: $HISTORY_SUCCESS"
 
-    # Идём с конца файла: нужно первое совпадение с конца, то есть самый
-    # свежий запуск. Дата не участвует, сравнивается только время.
-    local -a lines=()
-    local i ts n
     mapfile -t lines <"$HISTORY_SUCCESS"
-    for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
-        line=${lines[i]}
-        case $line in
-            ''|'#'*) continue ;;
-        esac
-        read -r d t rest <<<"$line"
-        [[ $t == [0-9][0-9]:[0-9][0-9]:[0-9][0-9] ]] || continue
-        # 02:44:59 -> 24459. Отсекаем с конца столько цифр, сколько их в
-        # значении --run: 59 -- секунды, 4459 -- минуты и секунды.
-        ts=${t//:/}
-        ts=$((10#$ts))
-        n=$((10 ** ${#digits}))
-        if (( ts % n == digits )); then
-            best=$line
-            best_time="$d $t"
-            break
-        fi
-    done
-    [[ -n $best ]] || die "в $HISTORY_SUCCESS нет запуска, время которого оканчивается на $digits"
+
+    if [[ -n $RUN_MOMENT ]]; then
+        digits=${RUN_MOMENT//[^0-9]/}
+        [[ -n $digits ]] || die "--run: в MOMENT нет цифр: $RUN_MOMENT"
+        (( ${#digits} <= 6 )) || die "--run: MOMENT длиннее 6 цифр (сс, ммсс или ччммсс): $RUN_MOMENT"
+        # приведение к целому: 02:44:59, 024459 и 24459 -- одно и то же
+        digits=$((10#$digits))
+
+        # Идём с конца файла: нужно первое совпадение с конца, то есть самый
+        # свежий запуск. Дата не участвует, сравнивается только время.
+        for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
+            line=${lines[i]}
+            case $line in
+                ''|'#'*) continue ;;
+            esac
+            read -r d t rest <<<"$line"
+            [[ $t == [0-9][0-9]:[0-9][0-9]:[0-9][0-9] ]] || continue
+            # 02:44:59 -> 24459. Отсекаем с конца столько цифр, сколько их в
+            # значении --run: 59 -- секунды, 4459 -- минуты и секунды.
+            ts=${t//:/}
+            ts=$((10#$ts))
+            n=$((10 ** ${#digits}))
+            if (( ts % n == digits )); then
+                best=$line
+                best_time="$d $t"
+                break
+            fi
+        done
+        [[ -n $best ]] || die "в $HISTORY_SUCCESS нет запуска, время которого оканчивается на $digits"
+    else
+        # --last: отрицательное N -- то же, что положительное, 0 -- как 1.
+        idx=${LAST_FROM_END#[+-]}
+        [[ $idx =~ ^[0-9]+$ ]] || die "--last: ожидается целое число: $LAST_FROM_END"
+        (( ${#idx} <= 9 )) || die "--last: слишком большое число: $LAST_FROM_END"
+        idx=$((10#$idx))
+        (( idx > 0 )) || idx=1
+
+        total=0
+        for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
+            line=${lines[i]}
+            case $line in
+                ''|'#'*) continue ;;
+            esac
+            (( ++total ))
+            if (( total == idx )); then
+                best=$line
+                read -r d t rest <<<"$line"
+                best_time="$d $t"
+                break
+            fi
+        done
+        (( total >= idx )) || die "в истории записей: $total, а запрошена $idx-я с конца"
+    fi
 
     # Команда -- в конце строки и начинается с пути к скрипту.
     tail=${best##*"$SCRIPT_NAME"}
@@ -691,7 +731,7 @@ run_from_history() {
     hist_args=("${hist_args[@]:1}")
 
     # Текущие опции: канонизируем и запоминаем, что перекрывать. Позиционных
-    # аргументов с --run нет, поэтому здесь только опции.
+    # аргументов с --run/--last нет, поэтому здесь только опции.
     parsed=$(getopt -o "$OPT_SHORT" --long "$OPT_LONG" -n "$SCRIPT_NAME" -- "${ORIG_ARGS[@]}") \
         || die "не смог разобрать текущие опции"
     eval set -- "$parsed"
@@ -699,7 +739,7 @@ run_from_history() {
         [[ $1 == -- ]] && break
         info=$(opt_name "$1") || die "внутренняя ошибка разбора опции: $1"
         name=${info%% *}
-        if [[ $name == run ]]; then
+        if [[ $name == run || $name == last ]]; then
             shift
             shift
             continue
@@ -720,7 +760,8 @@ run_from_history() {
         fi
     done
 
-    # Опции из истории: --run не повторяем, перекрытое текущими выбрасываем.
+    # Опции из истории: --run/--last не повторяем, перекрытое текущими
+    # выбрасываем.
     parsed=$(getopt -o "$OPT_SHORT" --long "$OPT_LONG" -n "$SCRIPT_NAME" -- "${hist_args[@]}") \
         || die "не смог разобрать команду из истории: $cmdline"
     eval set -- "$parsed"
@@ -735,7 +776,7 @@ run_from_history() {
                 fi
                 shift
                 ;;
-            run)
+            run|last)
                 shift
                 shift
                 ;;
@@ -798,7 +839,7 @@ run_from_history() {
     fi
 
     local answer=''
-    printf '\nЗапускаем? [Y/n] ' >&2
+    printf '\nRun? [Y/n] ' >&2
     if ! IFS= read -r answer; then
         # Ctrl+D -- тоже отказ
         printf '\nОтменено.\n' >&2
@@ -2046,9 +2087,9 @@ main() {
         return 0
     fi
 
-    # --run до любых ssh-заходов: он собирает argv и уходит в exec (или в exit,
-    # если подтверждения нет).
-    if [[ -n $RUN_MOMENT ]]; then
+    # --run/--last до любых ssh-заходов: они собирают argv и уходят в exec
+    # (или в exit, если подтверждения нет).
+    if [[ -n $RUN_MOMENT || -n $LAST_FROM_END ]]; then
         run_from_history
     fi
 

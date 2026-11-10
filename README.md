@@ -146,7 +146,7 @@ Before anything real happens the script prints the matched timestamp and the
 resulting command and asks:
 
 ```text
-Запускаем? [Y/n]
+Run? [Y/n]
 ```
 
 Enter, `y` or `yes` starts it; `n`, any other answer or Ctrl+D cancels without
@@ -154,8 +154,29 @@ starting and without a history record; Ctrl+C interrupts. With `--dry-run` or
 `--check` no confirmation is asked, because nothing is changed. Without a
 terminal (stdin is not a tty) the replay is refused with exit code 1.
 
-Positional addresses are not accepted together with `--run`; use `--from` /
-`--to` for overrides.
+### Replay the Nth latest run: --last
+
+`--last N` picks the N-th record from the end of `history.success` instead of
+matching a timestamp: 1 (or 0) is the latest, 2 the one before it, and so on.
+A negative N is treated as positive. Everything else works like `--run`:
+current options override the historical ones, the timestamp and command are
+printed, and `Run? [Y/n]` is asked before a real run.
+
+```bash
+# the latest successful run
+./port-fwd-creator.sh --last 1
+
+# the one before it, without creating a service
+./port-fwd-creator.sh --last 2 --no-persist
+
+# same as --last 3
+./port-fwd-creator.sh --last -3
+```
+
+`--run` and `--last` are mutually exclusive.
+
+Positional addresses are not accepted together with `--run` or `--last`; use
+`--from` / `--to` for overrides.
 
 ## What the script does
 
